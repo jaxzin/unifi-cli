@@ -159,6 +159,59 @@ fn clients_list_accepts_every_documented_field() {
     }
 }
 
+// --- `ports` surface ---
+
+#[test]
+fn ports_list_rejects_unknown_field() {
+    let out = unifi()
+        .args(["ports", "list", "--fields", "bogus"])
+        .output()
+        .expect("failed to run binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected usage exit code 2, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        error_envelope(&out.stderr)["error"]["kind"].as_str(),
+        Some("config_error")
+    );
+}
+
+#[test]
+fn devices_ports_and_ports_list_are_the_same_command() {
+    // Both spellings must accept a MAC and reach the network layer, not fail
+    // at argument parsing. Pointed at an unroutable host, so no controller.
+    for args in [
+        vec!["devices", "ports", "aa:bb:cc:dd:ee:ff"],
+        vec!["ports", "list", "aa:bb:cc:dd:ee:ff"],
+    ] {
+        let out = unifi().args(&args).output().expect("failed to run binary");
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "{args:?} must not be a usage error, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn ports_live_requires_a_mac() {
+    let out = unifi()
+        .args(["ports", "list", "--live"])
+        .output()
+        .expect("failed to run binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--live without a MAC must be a usage error"
+    );
+}
+
 // --- subcommand surface consistency ---
 
 #[test]
@@ -244,4 +297,137 @@ fn every_published_output_field_is_accepted_by_fields() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// One invocation per gated command, with the argument set it needs.
+const GATED_INVOCATIONS: &[(&str, &[&str])] = &[
+    ("clients block", &["aa:bb:cc:dd:ee:ff"]),
+    ("clients unblock", &["aa:bb:cc:dd:ee:ff"]),
+    ("clients kick", &["aa:bb:cc:dd:ee:ff"]),
+    ("devices restart", &["aa:bb:cc:dd:ee:ff"]),
+    ("devices upgrade", &["aa:bb:cc:dd:ee:ff"]),
+    ("ports cycle", &["aa:bb:cc:dd:ee:ff", "5"]),
+    ("ports poe", &["aa:bb:cc:dd:ee:ff", "5", "off"]),
+    ("protect rtsps delete", &["front-door"]),
+];
+
+/// Every command the schema publishes as `confirmation_required` must refuse to
+/// act when there is no `--yes` and no TTY to ask on, and must refuse locally.
+/// The host here is unroutable, so a `confirmation_required` envelope is also
+/// proof that nothing was sent to the controller: a command that fell through
+/// to HTTP would report a connection failure instead.
+#[test]
+fn every_confirmation_gated_command_refuses_without_yes_and_no_tty() {
+    let covered: Vec<&str> = GATED_INVOCATIONS.iter().map(|(c, _)| *c).collect();
+    for command in unifi_cli::CONFIRMATION_GATED_COMMANDS {
+        assert!(
+            covered.contains(command),
+            "`{command}` is confirmation-gated but has no invocation in GATED_INVOCATIONS"
+        );
+    }
+    assert_eq!(
+        covered.len(),
+        unifi_cli::CONFIRMATION_GATED_COMMANDS.len(),
+        "GATED_INVOCATIONS lists a command that is not in CONFIRMATION_GATED_COMMANDS"
+    );
+
+    for (command, extra) in GATED_INVOCATIONS {
+        let mut args: Vec<&str> = command.split(' ').collect();
+        args.extend_from_slice(extra);
+
+        let out = unifi()
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run binary");
+
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{command}` should exit 2 without --yes, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            error_envelope(&out.stderr)["error"]["kind"].as_str(),
+            Some("confirmation_required"),
+            "`{command}` should report confirmation_required, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A mutating command that is not gated must not start asking for confirmation:
+/// it reaches the controller (and fails on the unroutable host) instead. This is
+/// the negative control for the test above, which would otherwise still pass if
+/// every command refused everything.
+#[test]
+fn ungated_mutating_commands_do_not_ask_for_confirmation() {
+    for args in [
+        vec!["devices", "locate", "aa:bb:cc:dd:ee:ff"],
+        vec!["clients", "set-fixed-ip", "aa:bb:cc:dd:ee:ff", "192.0.2.10"],
+    ] {
+        let out = unifi()
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run binary");
+
+        let kind = error_envelope(&out.stderr)["error"]["kind"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_ne!(
+            kind,
+            "confirmation_required",
+            "`{}` is not in CONFIRMATION_GATED_COMMANDS but asked for confirmation",
+            args.join(" ")
+        );
+    }
+}
+
+// --- A consumer that stops reading is not this tool's failure ---
+
+/// `unifi ... | head -5`, or any consumer that exits before the output ends,
+/// closes the pipe mid-write. Rust ignores SIGPIPE at startup, so the write
+/// used to fail with EPIPE, panic with "failed printing to stdout: Broken
+/// pipe", and exit 101, which reads as this tool crashing.
+///
+/// `completions bash` writes more than a pipe buffer holds and needs no
+/// controller, so the child is guaranteed to be mid-write when the read end
+/// closes.
+#[cfg(unix)]
+#[test]
+fn a_consumer_that_stops_reading_does_not_crash_the_tool() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_unifi"))
+        .args(["completions", "bash"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+
+    // Close the read end while the child still has output to write.
+    drop(child.stdout.take());
+
+    let out = child.wait_with_output().expect("failed to wait for binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !stderr.contains("panicked"),
+        "a closed pipe must not produce a panic: {stderr}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "a closed pipe must not exit as a panic: {stderr}"
+    );
+    assert_eq!(
+        out.status.signal(),
+        Some(13),
+        "the process should end on SIGPIPE, the way every other tool in a \
+         pipeline does: {:?} {stderr}",
+        out.status
+    );
 }

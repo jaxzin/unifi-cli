@@ -104,6 +104,7 @@ pub mod exit_codes {
     pub const AUTH_ERROR: i32 = 3;
     pub const NOT_FOUND: i32 = 4;
     pub const API_ERROR: i32 = 5;
+    pub const CONFLICT: i32 = 6;
 }
 
 /// Map an error to a specific exit code by downcasting to ApiError.
@@ -113,6 +114,8 @@ pub fn exit_code_for_error(err: &(dyn std::error::Error + 'static)) -> i32 {
             crate::api::ApiError::Auth(_) => exit_codes::AUTH_ERROR,
             crate::api::ApiError::NotFound(_) => exit_codes::NOT_FOUND,
             crate::api::ApiError::Api { .. } => exit_codes::API_ERROR,
+            crate::api::ApiError::Unsupported { .. } => exit_codes::NOT_FOUND,
+            crate::api::ApiError::Conflict(_) => exit_codes::CONFLICT,
             crate::api::ApiError::Http(_) | crate::api::ApiError::Other(_) => {
                 exit_codes::GENERAL_ERROR
             }
@@ -128,7 +131,24 @@ pub fn error_kind_and_code(err: &(dyn std::error::Error + 'static)) -> (&'static
         match api_err {
             crate::api::ApiError::Auth(_) => ("auth_error", exit_codes::AUTH_ERROR),
             crate::api::ApiError::NotFound(_) => ("not_found", exit_codes::NOT_FOUND),
+            // 408 and 429 are the two 4xx that invite the same request again,
+            // so they stay retryable even though they are client errors.
+            crate::api::ApiError::Api {
+                status: 408 | 429, ..
+            } => ("retry_later", exit_codes::API_ERROR),
+            // Any other 4xx means the request itself was rejected, so retrying
+            // it unchanged cannot help. It shares exit code 5 with api_error
+            // but reports a distinct kind, so an agent branching on
+            // `retryable` does not loop on a permanent failure.
+            crate::api::ApiError::Api { status, .. } if (400..500).contains(status) => {
+                ("client_error", exit_codes::API_ERROR)
+            }
             crate::api::ApiError::Api { .. } => ("api_error", exit_codes::API_ERROR),
+            // The whole API is absent, not one record, so this shares
+            // not_found's exit code but keeps a distinct kind: there is no
+            // other identifier worth trying.
+            crate::api::ApiError::Unsupported { .. } => ("unsupported", exit_codes::NOT_FOUND),
+            crate::api::ApiError::Conflict(_) => ("conflict", exit_codes::CONFLICT),
             crate::api::ApiError::Http(_) | crate::api::ApiError::Other(_) => {
                 ("general_error", exit_codes::GENERAL_ERROR)
             }
@@ -141,7 +161,7 @@ pub fn error_kind_and_code(err: &(dyn std::error::Error + 'static)) -> (&'static
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::ApiError;
+    use crate::api::{ApiError, UnsupportedReason};
 
     #[test]
     fn exit_code_for_auth_error() {
@@ -205,6 +225,139 @@ mod tests {
     }
 
     #[test]
+    fn error_kind_and_code_client_error_for_a_rejected_request() {
+        // The controller answers `power-cycle` on a PoE-disabled port with
+        // HTTP 400 api.err.InvalidTargetPort. Retrying that unchanged can only
+        // fail again, so it must not be published as the retryable api_error.
+        let err = ApiError::Api {
+            status: 400,
+            message: "api.err.InvalidTargetPort".into(),
+        };
+        let (kind, code) = error_kind_and_code(&err);
+        assert_eq!(kind, "client_error");
+        assert_eq!(code, exit_codes::API_ERROR);
+    }
+
+    #[test]
+    fn error_kind_and_code_keeps_408_and_429_retryable() {
+        // Both statuses ask for the same request again, so they must not land
+        // in the permanent client_error bucket an agent gives up on.
+        for status in [408u16, 429] {
+            let err = ApiError::Api {
+                status,
+                message: "slow down".into(),
+            };
+            let (kind, code) = error_kind_and_code(&err);
+            assert_eq!(kind, "retry_later", "status {status}");
+            assert_eq!(code, exit_codes::API_ERROR, "status {status}");
+        }
+    }
+
+    #[test]
+    fn error_kind_and_code_api_error_stays_for_server_side_failures() {
+        for status in [500u16, 502, 503] {
+            let err = ApiError::Api {
+                status,
+                message: "upstream failure".into(),
+            };
+            let (kind, code) = error_kind_and_code(&err);
+            assert_eq!(kind, "api_error", "status {status}");
+            assert_eq!(code, exit_codes::API_ERROR, "status {status}");
+        }
+    }
+
+    // An absent application shares not_found's exit code (nothing is there to
+    // find) but must keep its own kind: with not_found an agent can sensibly
+    // try another identifier, here there is no identifier that would work.
+    #[test]
+    fn error_kind_and_code_unsupported_is_distinct_from_not_found() {
+        let err = ApiError::Unsupported {
+            endpoint: "/proxy/protect/integration/v1/cameras".into(),
+            reason: UnsupportedReason::NotJson {
+                content_type: "text/html".into(),
+            },
+        };
+        let (kind, code) = error_kind_and_code(&err);
+        assert_eq!(kind, "unsupported");
+        assert_eq!(code, exit_codes::NOT_FOUND);
+        assert_eq!(exit_code_for_error(&err), exit_codes::NOT_FOUND);
+    }
+
+    // Both reasons mean "the endpoint is not there", so they must publish the
+    // same kind and code. A caller that branches on the kind cannot be made to
+    // care which way the controller said it.
+    #[test]
+    fn error_kind_and_code_unsupported_is_the_same_for_a_removed_endpoint() {
+        let err = ApiError::Unsupported {
+            endpoint: "/proxy/network/api/s/default/stat/event?_limit=20".into(),
+            reason: UnsupportedReason::Removed,
+        };
+        let (kind, code) = error_kind_and_code(&err);
+        assert_eq!(kind, "unsupported");
+        assert_eq!(code, exit_codes::NOT_FOUND);
+        assert_eq!(exit_code_for_error(&err), exit_codes::NOT_FOUND);
+    }
+
+    #[test]
+    fn unsupported_message_names_the_endpoint_and_the_content_type() {
+        let err = ApiError::Unsupported {
+            endpoint: "/proxy/protect/integration/v1/cameras".into(),
+            reason: UnsupportedReason::NotJson {
+                content_type: "text/html".into(),
+            },
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("/proxy/protect/integration/v1/cameras"),
+            "got: {message}"
+        );
+        assert!(message.contains("text/html"), "got: {message}");
+        assert!(
+            message.contains("Protect"),
+            "a Protect endpoint names the application that is missing: {message}"
+        );
+    }
+
+    #[test]
+    fn unsupported_message_for_a_network_endpoint_does_not_blame_protect() {
+        let err = ApiError::Unsupported {
+            endpoint: "/proxy/network/api/s/default/stat/device".into(),
+            reason: UnsupportedReason::NotJson {
+                content_type: "text/html".into(),
+            },
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("/proxy/network/api/s/default/stat/device"),
+            "got: {message}"
+        );
+        assert!(!message.contains("Protect"), "got: {message}");
+    }
+
+    // A removed endpoint must not be described as a content-type problem: the
+    // controller answered with perfectly good JSON, it just refused the
+    // endpoint. Saying otherwise sends the reader after a fault that is not
+    // there.
+    #[test]
+    fn unsupported_message_for_a_removed_endpoint_does_not_mention_json() {
+        let err = ApiError::Unsupported {
+            endpoint: "/proxy/network/api/s/default/stat/event?_limit=20".into(),
+            reason: UnsupportedReason::Removed,
+        };
+        let message = err.to_string();
+        assert!(message.contains("/stat/event"), "got: {message}");
+        assert!(
+            !message.contains("instead of JSON"),
+            "a removed endpoint is not a decoding problem: {message}"
+        );
+        assert!(
+            message.contains("WebSocket"),
+            "the events case names what is left instead: {message}"
+        );
+        assert!(!message.contains("Protect"), "got: {message}");
+    }
+
+    #[test]
     fn error_envelope_is_valid_json() {
         let envelope = serde_json::json!({
             "error": {
@@ -214,5 +367,19 @@ mod tests {
         });
         assert!(envelope["error"]["kind"].as_str().is_some());
         assert!(envelope["error"]["message"].as_str().is_some());
+    }
+
+    #[test]
+    fn exit_code_for_conflict() {
+        let err = ApiError::Conflict("port has no PoE".into());
+        assert_eq!(exit_code_for_error(&err), exit_codes::CONFLICT);
+    }
+
+    #[test]
+    fn error_kind_and_code_conflict() {
+        let err = ApiError::Conflict("port has no PoE".into());
+        let (kind, code) = error_kind_and_code(&err);
+        assert_eq!(kind, "conflict");
+        assert_eq!(code, 6);
     }
 }

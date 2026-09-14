@@ -11,6 +11,72 @@ pub fn error_for_status(status: u16, message: String) -> ApiError {
     }
 }
 
+/// True when a legacy API error means the endpoint itself is not there.
+///
+/// UniFi Network answers an unknown `stat/` path with 404 `api.err.NotFound`
+/// and an unknown `rest/` resource with 400 `api.err.InvalidObject`, verified
+/// against a UniFi OS 9 controller by control: a nonsense resource and
+/// `rest/alarm` produce byte-identical 400s while `rest/networkconf` returns
+/// records.
+///
+/// A 400 alone does not carry that meaning, since the same status reports a
+/// genuinely malformed request, so the marker string is required too and this
+/// is only consulted for a request that carries no caller-supplied body or
+/// parameters that could be the invalid object.
+fn is_absent_legacy_endpoint(err: &ApiError) -> bool {
+    match err {
+        ApiError::NotFound(_) => true,
+        ApiError::Api {
+            status: 400,
+            message,
+        } => message.contains("api.err.InvalidObject"),
+        _ => false,
+    }
+}
+
+/// Decode a successful response as JSON, naming what answered when it is not.
+///
+/// UniFi OS answers a request for an application the controller does not have
+/// by proxying it to the web UI, which returns 200 with an HTML page. Decoding
+/// that as JSON produces "error decoding response body", which names neither
+/// the endpoint nor the reason, so the caller cannot tell a missing application
+/// from a transport fault worth retrying.
+///
+/// The body is decoded first and the content type only chooses the error for a
+/// body that did not decode: a controller or proxy that serves JSON under
+/// `text/plain` or under no content type at all is still answering the request,
+/// so it must not be reported as an application that is not there.
+async fn json_or_unsupported<T: DeserializeOwned>(
+    resp: reqwest::Response,
+    endpoint: &str,
+) -> Result<T, ApiError> {
+    let raw = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp.bytes().await?;
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(value),
+        // A body that claims to be JSON and is not is a fault in a controller
+        // that does serve this endpoint, which is a different thing entirely.
+        Err(e) if raw.to_ascii_lowercase().contains("json") => Err(ApiError::Other(format!(
+            "Failed to decode the response from {endpoint}: {e}"
+        ))),
+        Err(_) => {
+            let content_type = match raw.split(';').next().map(str::trim) {
+                Some(t) if !t.is_empty() => t.to_string(),
+                _ => "no content type".to_string(),
+            };
+            Err(ApiError::Unsupported {
+                endpoint: endpoint.to_string(),
+                reason: UnsupportedReason::NotJson { content_type },
+            })
+        }
+    }
+}
+
 /// Valid RTSPS quality levels accepted by the Protect API.
 const VALID_QUALITIES: &[&str] = &["high", "medium", "low", "package"];
 
@@ -105,7 +171,7 @@ impl UnifiClient {
                 .get_integration("/proxy/network/integration/v1/sites")
                 .await?;
             let site = resp.data.into_iter().next().ok_or_else(|| {
-                ApiError::Other("No sites found — check that the API key has site access".into())
+                ApiError::Other("No sites found. Check that the API key has site access".into())
             })?;
             self.site_id = Some(site.id);
         }
@@ -120,18 +186,19 @@ impl UnifiClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        Ok(resp.json().await?)
+        json_or_unsupported(resp, path).await
     }
 
     async fn get_legacy<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, ApiError> {
-        let url = format!("{}/proxy/network/api/s/default{path}", self.base_url);
+        let endpoint = format!("/proxy/network/api/s/default{path}");
+        let url = format!("{}{endpoint}", self.base_url);
         let resp = self.http.get(&url).send().await?;
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        let legacy: LegacyResponse<T> = resp.json().await?;
+        let legacy: LegacyResponse<T> = json_or_unsupported(resp, &endpoint).await?;
         if legacy.meta.rc != "ok" {
             return Err(ApiError::Api {
                 status: 200,
@@ -146,17 +213,15 @@ impl UnifiClient {
         manager: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, ApiError> {
-        let url = format!(
-            "{}/proxy/network/api/s/default/cmd/{manager}",
-            self.base_url
-        );
+        let endpoint = format!("/proxy/network/api/s/default/cmd/{manager}");
+        let url = format!("{}{endpoint}", self.base_url);
         let resp = self.http.post(&url).json(&body).send().await?;
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        Ok(resp.json().await?)
+        json_or_unsupported(resp, &endpoint).await
     }
 
     async fn put_legacy<T: serde::Serialize>(
@@ -164,14 +229,15 @@ impl UnifiClient {
         path: &str,
         body: &T,
     ) -> Result<serde_json::Value, ApiError> {
-        let url = format!("{}/proxy/network/api/s/default{path}", self.base_url);
+        let endpoint = format!("/proxy/network/api/s/default{path}");
+        let url = format!("{}{endpoint}", self.base_url);
         let resp = self.http.put(&url).json(body).send().await?;
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        Ok(resp.json().await?)
+        json_or_unsupported(resp, &endpoint).await
     }
 
     async fn post_legacy<T: serde::Serialize>(
@@ -179,14 +245,15 @@ impl UnifiClient {
         path: &str,
         body: &T,
     ) -> Result<serde_json::Value, ApiError> {
-        let url = format!("{}/proxy/network/api/s/default{path}", self.base_url);
+        let endpoint = format!("/proxy/network/api/s/default{path}");
+        let url = format!("{}{endpoint}", self.base_url);
         let resp = self.http.post(&url).json(body).send().await?;
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        Ok(resp.json().await?)
+        json_or_unsupported(resp, &endpoint).await
     }
 
     // Paginate through all results from Integration API
@@ -339,6 +406,48 @@ impl UnifiClient {
         Ok(())
     }
 
+    /// Power-cycle a single PoE port. `mac` is the **switch's** MAC, not the
+    /// attached device's.
+    pub async fn power_cycle_port(&self, mac: &str, port_idx: u32) -> Result<(), ApiError> {
+        let formatted = format_mac(&normalize_mac(mac));
+        self.post_legacy_cmd(
+            "devmgr",
+            serde_json::json!({"cmd": "power-cycle", "mac": formatted, "port_idx": port_idx}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Replace a device's `port_overrides` array. The controller treats the
+    /// array as the whole desired set, so callers must pass the merged list
+    /// (see `commands::ports::merge_poe_override`), never a single entry.
+    pub async fn set_port_overrides(
+        &self,
+        device_id: &str,
+        port_overrides: &[serde_json::Value],
+    ) -> Result<(), ApiError> {
+        let path = format!("/rest/device/{device_id}");
+        let resp = self
+            .put_legacy(
+                &path,
+                &serde_json::json!({ "port_overrides": port_overrides }),
+            )
+            .await?;
+        if let Some(rc) = resp.pointer("/meta/rc").and_then(|v| v.as_str())
+            && rc != "ok"
+        {
+            return Err(ApiError::Api {
+                status: 200,
+                message: resp
+                    .pointer("/meta/msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn upgrade_device(&self, mac: &str) -> Result<(), ApiError> {
         let formatted = format_mac(&normalize_mac(mac));
         self.post_legacy_cmd(
@@ -366,6 +475,66 @@ impl UnifiClient {
         .await
     }
 
+    pub async fn get_network_detail(&self, identifier: &str) -> Result<LegacyNetwork, ApiError> {
+        let networks: Vec<LegacyNetwork> = self.get_legacy("/rest/networkconf").await?;
+        networks
+            .into_iter()
+            .find(|network| {
+                network.id == identifier
+                    || network
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(identifier))
+            })
+            .ok_or_else(|| ApiError::NotFound(format!("Network not found: {identifier}")))
+    }
+
+    pub async fn list_port_forwards(&self) -> Result<Vec<PortForward>, ApiError> {
+        self.get_legacy("/rest/portforward").await
+    }
+
+    pub async fn get_port_forward(&self, identifier: &str) -> Result<PortForward, ApiError> {
+        self.list_port_forwards()
+            .await?
+            .into_iter()
+            .find(|forward| {
+                forward.id == identifier
+                    || forward
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(identifier))
+            })
+            .ok_or_else(|| ApiError::NotFound(format!("Port forward '{identifier}' not found")))
+    }
+
+    pub async fn list_wan_interfaces(&self) -> Result<Vec<NamedWanInterface>, ApiError> {
+        let gateways: Vec<GatewayWanStatus> = self.get_legacy("/stat/device").await?;
+        let gateway = gateways
+            .into_iter()
+            .find(|device| matches!(device.device_type.as_deref(), Some("ugw" | "udm")))
+            .ok_or_else(|| ApiError::NotFound("UniFi gateway not found".into()))?;
+        let mut interfaces = Vec::new();
+        if let Some(interface) = gateway.wan1 {
+            interfaces.push(NamedWanInterface {
+                slot: "wan1",
+                interface,
+            });
+        }
+        if let Some(interface) = gateway.wan2 {
+            interfaces.push(NamedWanInterface {
+                slot: "wan2",
+                interface,
+            });
+        }
+        if let Some(interface) = gateway.wan3 {
+            interfaces.push(NamedWanInterface {
+                slot: "wan3",
+                interface,
+            });
+        }
+        Ok(interfaces)
+    }
+
     // Events
     //
     // Legacy `stat/event` was removed in UniFi Network 9+ (UniFi OS) and now
@@ -374,21 +543,30 @@ impl UnifiClient {
     // `Event` shape, so fall back to it. (The full live event stream on newer
     // controllers is only exposed over the events WebSocket, which this REST
     // client does not consume.)
+    //
+    // Some UniFi Network 9 builds serve neither. Reporting the fallback's own
+    // rejection verbatim would tell a caller that its request was malformed and
+    // invite it to retry with different parameters, when in truth the whole
+    // event surface is gone and nothing it can send would work.
     pub async fn list_events(&self, limit: usize) -> Result<Vec<Event>, ApiError> {
-        match self
-            .get_legacy::<Event>(&format!("/stat/event?_limit={limit}"))
-            .await
-        {
+        let events_path = format!("/stat/event?_limit={limit}");
+        match self.get_legacy::<Event>(&events_path).await {
             Ok(events) => Ok(events),
-            Err(ApiError::NotFound(_)) => {
-                let mut alarms: Vec<Event> = self.get_legacy("/rest/alarm").await?;
+            Err(ApiError::NotFound(_)) => match self.get_legacy::<Event>("/rest/alarm").await {
                 // `rest/alarm` is neither time-ordered nor limited server-side;
                 // present the most recent `limit` records to match the
                 // semantics `stat/event?_limit=` provided on older controllers.
-                alarms.sort_by_key(|e| std::cmp::Reverse(e.time));
-                alarms.truncate(limit);
-                Ok(alarms)
-            }
+                Ok(mut alarms) => {
+                    alarms.sort_by_key(|e| std::cmp::Reverse(e.time));
+                    alarms.truncate(limit);
+                    Ok(alarms)
+                }
+                Err(e) if is_absent_legacy_endpoint(&e) => Err(ApiError::Unsupported {
+                    endpoint: format!("/proxy/network/api/s/default{events_path}"),
+                    reason: UnsupportedReason::Removed,
+                }),
+                Err(e) => Err(e),
+            },
             Err(e) => Err(e),
         }
     }
@@ -405,6 +583,13 @@ impl UnifiClient {
                     .is_some_and(|m| normalize_mac(m) == normalized)
             })
             .ok_or_else(|| ApiError::NotFound(format!("Device with MAC {mac}")))
+    }
+
+    /// Every device that reports a port table, in one request. `/stat/device`
+    /// already returns all devices with their port tables, so the unfiltered
+    /// listing costs no more than the filtered one.
+    pub async fn list_all_device_ports(&self) -> Result<Vec<DeviceWithPorts>, ApiError> {
+        self.get_legacy("/stat/device").await
     }
 
     // All clients with bandwidth data (legacy endpoint for richer stats)
@@ -448,10 +633,8 @@ impl UnifiClient {
         qualities: &[String],
     ) -> Result<RtspsStreams, ApiError> {
         validate_qualities(qualities)?;
-        let url = format!(
-            "{}/proxy/protect/integration/v1/cameras/{camera_id}/rtsps-stream",
-            self.base_url
-        );
+        let endpoint = format!("/proxy/protect/integration/v1/cameras/{camera_id}/rtsps-stream");
+        let url = format!("{}{endpoint}", self.base_url);
         let body = serde_json::json!({ "qualities": qualities });
         let resp = self.http.post(&url).json(&body).send().await?;
         let status = resp.status().as_u16();
@@ -459,7 +642,7 @@ impl UnifiClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        Ok(resp.json().await?)
+        json_or_unsupported(resp, &endpoint).await
     }
 
     /// Delete RTSPS streams for a camera at the specified quality levels.
@@ -490,6 +673,11 @@ impl UnifiClient {
     /// Resolve a camera identifier (ID or name) to a camera ID.
     /// If the input is a 24-char hex string, treats it as an ID.
     /// Otherwise, searches by name (case-insensitive).
+    ///
+    /// A name that fits more than one camera is an error rather than a choice
+    /// made silently: the caller may be about to delete that camera's streams,
+    /// and picking whichever the controller happened to list first would act on
+    /// a different camera than the one the user was asked to confirm.
     pub async fn resolve_camera_id(&self, id_or_name: &str) -> Result<String, ApiError> {
         // If it looks like a Protect camera ID (24 hex chars), use it directly
         if id_or_name.len() == 24 && id_or_name.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -498,15 +686,30 @@ impl UnifiClient {
         // Otherwise, search by name
         let cameras = self.list_protect_cameras().await?;
         let needle = id_or_name.to_lowercase();
-        cameras
+        let mut matches: Vec<ProtectCamera> = cameras
             .into_iter()
-            .find(|c| {
+            .filter(|c| {
                 c.name
                     .as_deref()
                     .is_some_and(|n| n.trim().to_lowercase() == needle)
             })
-            .map(|c| c.id)
-            .ok_or_else(|| ApiError::NotFound(format!("Camera '{id_or_name}'")))
+            .collect();
+
+        match matches.len() {
+            0 => Err(ApiError::NotFound(format!("Camera '{id_or_name}'"))),
+            1 => Ok(matches.pop().expect("checked len == 1 above").id),
+            _ => {
+                let list = matches
+                    .iter()
+                    .map(|c| c.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(ApiError::Conflict(format!(
+                    "'{id_or_name}' matches {} cameras: {list}. Use the ID.",
+                    matches.len()
+                )))
+            }
+        }
     }
 
     // System
@@ -528,7 +731,7 @@ impl UnifiClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        Ok(resp.json().await?)
+        json_or_unsupported(resp, "/api/system").await
     }
 }
 
@@ -558,7 +761,7 @@ impl ProtectSession {
     ) -> Result<Self, ApiError> {
         let base_url = normalize_base_url(host)?;
 
-        // Don't use cookie_provider — the `partitioned` cookie attribute
+        // Don't use cookie_provider: the `partitioned` cookie attribute
         // isn't handled by reqwest's jar. We extract the token manually.
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(options.accept_invalid_certs)
@@ -618,7 +821,8 @@ impl ProtectSession {
 
     /// GET from the direct Protect API (cookie-authenticated).
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
-        let url = format!("{}/proxy/protect/api{path}", self.base_url);
+        let endpoint = format!("/proxy/protect/api{path}");
+        let url = format!("{}{endpoint}", self.base_url);
         let mut req = self
             .http
             .get(&url)
@@ -632,9 +836,7 @@ impl ProtectSession {
             let body = resp.text().await.unwrap_or_default();
             return Err(error_for_status(status, body));
         }
-        let bytes = resp.bytes().await.map_err(ApiError::Http)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| ApiError::Other(format!("JSON parse error: {e}")))
+        json_or_unsupported(resp, &endpoint).await
     }
 
     /// List all cameras from the direct Protect API (full objects).

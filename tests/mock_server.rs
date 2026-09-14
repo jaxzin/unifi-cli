@@ -1,4 +1,4 @@
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{body_json, method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Helper to create a UnifiClient pointing at the mock server
@@ -22,6 +22,94 @@ async fn mount_site_discovery(server: &MockServer) {
         .await;
 }
 
+/// Run the real `unifi` binary against `server` and return the JSON it printed.
+///
+/// Driving the binary rather than calling the command function is what makes a
+/// schema check meaningful: it inspects the bytes a caller actually receives.
+async fn run_json(server: &MockServer, args: &[&str]) -> serde_json::Value {
+    let uri = server.uri();
+    let mut argv = vec!["--host", uri.as_str(), "--api-key", "test-key"];
+    argv.extend_from_slice(args);
+    argv.extend_from_slice(&["--output", "json"]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+        .args(&argv)
+        .output()
+        .expect("failed to run the unifi binary");
+    assert!(
+        output.status.success(),
+        "{} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout of `{}` was not valid JSON ({e}): {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+/// The one record whose keys `output_fields` describes.
+///
+/// A list command wraps its records in a pagination envelope, `devices ports`
+/// and `system health` emit a bare array, and a detail command emits the record
+/// on its own. The schema describes a record in every case.
+fn one_record(command: &str, body: &serde_json::Value) -> serde_json::Value {
+    let record = match body {
+        serde_json::Value::Array(items) => items.first(),
+        serde_json::Value::Object(fields) => match fields.get("items") {
+            Some(serde_json::Value::Array(items)) => items.first(),
+            _ => Some(body),
+        },
+        _ => None,
+    };
+    record
+        .unwrap_or_else(|| panic!("`{command}` emitted no record to check against: {body}"))
+        .clone()
+}
+
+/// Assert `unifi schema` declares for `command` exactly the keys the command
+/// emits: no undiscoverable field, and no documented field that never appears.
+///
+/// For an agent-facing CLI the schema is the contract, and nothing else in this
+/// suite would catch the two halves drifting apart. Each command that publishes
+/// `output_fields` gets one of these; the check lives here once so adding it to
+/// a command costs a single call.
+fn assert_schema_matches(command: &str, body: &serde_json::Value) {
+    let record = one_record(command, body);
+    let emitted = record
+        .as_object()
+        .unwrap_or_else(|| panic!("`{command}` must emit a JSON object: {body}"));
+
+    let schema_output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+        .arg("schema")
+        .output()
+        .expect("failed to run unifi schema");
+    let schema: serde_json::Value =
+        serde_json::from_slice(&schema_output.stdout).expect("unifi schema must print valid JSON");
+    let entry = schema["commands"]
+        .as_array()
+        .expect("schema must have a commands array")
+        .iter()
+        .find(|c| c["name"] == command)
+        .unwrap_or_else(|| panic!("schema must publish a \"{command}\" command"));
+
+    let mut declared: Vec<&str> = entry["output_fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`{command}` must declare output_fields"))
+        .iter()
+        .map(|f| f["name"].as_str().expect("output field must have a name"))
+        .collect();
+    declared.sort_unstable();
+    let mut actual: Vec<&str> = emitted.keys().map(String::as_str).collect();
+    actual.sort_unstable();
+    assert_eq!(
+        actual, declared,
+        "`{command}` output_fields in the schema must exactly match the keys it emits"
+    );
+}
+
 // --- UnifiClient API tests ---
 
 mod client_api {
@@ -37,8 +125,8 @@ mod client_api {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "offset": 0, "limit": 200, "count": 2, "totalCount": 2,
                 "data": [
-                    {"macAddress": "aa:bb:cc:dd:ee:ff", "ipAddress": "10.0.0.1", "name": "Device1", "type": "WIRED"},
-                    {"macAddress": "11:22:33:44:55:66", "ipAddress": "10.0.0.2", "hostname": "host2", "type": "WIRELESS"}
+                    {"macAddress": "aa:bb:cc:dd:ee:ff", "ipAddress": "192.0.2.1", "name": "Device1", "type": "WIRED"},
+                    {"macAddress": "11:22:33:44:55:66", "ipAddress": "192.0.2.2", "hostname": "host2", "type": "WIRELESS"}
                 ]
             })))
             .mount(&server)
@@ -98,8 +186,8 @@ mod client_api {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"_id": "abc", "mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.1", "name": "Target", "is_wired": true, "uptime": 7200},
-                    {"_id": "def", "mac": "11:22:33:44:55:66", "ip": "10.0.0.2"}
+                    {"_id": "abc", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.0.2.1", "name": "Target", "is_wired": true, "uptime": 7200},
+                    {"_id": "def", "mac": "11:22:33:44:55:66", "ip": "192.0.2.2"}
                 ]
             })))
             .mount(&server)
@@ -178,7 +266,7 @@ mod client_api {
 
         let client = mock_client(&server).await;
         client
-            .set_fixed_ip("aa:bb:cc:dd:ee:ff", "10.0.0.50", None)
+            .set_fixed_ip("aa:bb:cc:dd:ee:ff", "192.0.2.50", None)
             .await
             .unwrap();
     }
@@ -220,7 +308,7 @@ mod client_api {
 
         let client = mock_client(&server).await;
         client
-            .set_fixed_ip("aa:bb:cc:dd:ee:ff", "10.0.0.99", Some("NewDevice"))
+            .set_fixed_ip("aa:bb:cc:dd:ee:ff", "192.0.2.99", Some("NewDevice"))
             .await
             .unwrap();
     }
@@ -240,7 +328,7 @@ mod client_api {
 
         let client = mock_client(&server).await;
         let err = client
-            .set_fixed_ip("00:00:00:00:00:00", "10.0.0.1", None)
+            .set_fixed_ip("00:00:00:00:00:00", "192.0.2.1", None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Not found"));
@@ -310,8 +398,8 @@ mod client_api {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "offset": 0, "limit": 200, "count": 2, "totalCount": 2,
                 "data": [
-                    {"macAddress": "9c:05:d6:bc:06:43", "ipAddress": "192.168.1.1", "name": "UCG Ultra", "model": "UCG Ultra", "state": "ONLINE", "firmwareVersion": "5.0.12"},
-                    {"macAddress": "60:22:32:58:b8:00", "ipAddress": "192.168.1.190", "name": "U6-Lite", "model": "U6 Lite", "state": "ONLINE", "firmwareVersion": "6.7.41"}
+                    {"macAddress": "aa:bb:cc:dd:06:43", "ipAddress": "198.51.100.1", "name": "UCG Ultra", "model": "UCG Ultra", "state": "ONLINE", "firmwareVersion": "5.0.12"},
+                    {"macAddress": "aa:bb:cc:dd:b8:00", "ipAddress": "198.51.100.190", "name": "U6-Lite", "model": "U6 Lite", "state": "ONLINE", "firmwareVersion": "6.7.41"}
                 ]
             })))
             .mount(&server)
@@ -340,6 +428,32 @@ mod client_api {
 
         let client = mock_client(&server).await;
         client.restart_device("aa:bb:cc:dd:ee:ff").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn power_cycle_port_sends_correct_command() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/proxy/network/api/s/default/cmd/devmgr"))
+            .and(body_json(serde_json::json!({
+                "cmd": "power-cycle",
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "port_idx": 5
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        client
+            .power_cycle_port("AA-BB-CC-DD-EE-FF", 5)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -430,6 +544,95 @@ mod client_api {
     }
 
     #[tokio::test]
+    async fn get_network_detail_matches_name_without_exposing_unknown_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/rest/networkconf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "_id": "net-1", "name": "IoT", "purpose": "corporate",
+                    "vlan": 20, "ip_subnet": "192.0.2.1/24", "enabled": true,
+                    "dhcpd_enabled": true, "dhcpd_dns_enabled": true,
+                    "dhcpd_dns_1": "192.0.2.53", "mdns_enabled": true,
+                    "lte_lan_enabled": false,
+                    "x_private_key": "must-never-be-deserialized"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let network = client.get_network_detail("iot").await.unwrap();
+        assert_eq!(network.id, "net-1");
+        assert_eq!(network.vlan, Some(20));
+        assert_eq!(network.lte_lan_enabled, Some(false));
+    }
+
+    #[tokio::test]
+    async fn port_forwards_list_and_resolve_exact_name_or_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/rest/portforward"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "_id": "forward-1", "name": "Plex", "enabled": true,
+                    "proto": "tcp", "dst_port": "32400", "fwd": "192.0.2.10",
+                    "fwd_port": "32400", "pfwd_interface": "wan",
+                    "x_private_key": "must-not-escape"
+                }]
+            })))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        assert_eq!(client.list_port_forwards().await.unwrap().len(), 1);
+        assert_eq!(
+            client.get_port_forward("plex").await.unwrap().id,
+            "forward-1"
+        );
+        assert_eq!(
+            client
+                .get_port_forward("forward-1")
+                .await
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Plex")
+        );
+    }
+
+    #[tokio::test]
+    async fn wan_inventory_returns_gateway_interfaces_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"type": "usw", "wan1": {"name": "ignore-me"}},
+                    {"type": "udm",
+                     "wan1": {"name": "Primary", "ifname": "eth9", "enable": true, "up": true},
+                     "wan3": {"name": "Backup", "ifname": "gre1", "up": true,
+                        "mbb_state": "ready", "mbb": {"signal_pct": 75, "rat": "LTE"},
+                        "x_private_key": "must-not-escape"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        let client = mock_client(&server).await;
+        let interfaces = client.list_wan_interfaces().await.unwrap();
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[0].slot, "wan1");
+        assert_eq!(
+            interfaces[1].interface.mbb.as_ref().unwrap().signal_pct,
+            Some(75.0)
+        );
+    }
+
+    #[tokio::test]
     async fn get_health_returns_subsystems() {
         let server = MockServer::start().await;
 
@@ -438,7 +641,7 @@ mod client_api {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"subsystem": "wan", "status": "ok", "wan_ip": "81.172.153.156", "isp_name": "Caiway"},
+                    {"subsystem": "wan", "status": "ok", "wan_ip": "203.0.113.156", "isp_name": "ExampleISP"},
                     {"subsystem": "wlan", "status": "ok", "num_ap": 3, "num_sta": 15},
                     {"subsystem": "lan", "status": "ok", "num_sw": 4, "num_sta": 20}
                 ]
@@ -449,7 +652,7 @@ mod client_api {
         let client = mock_client(&server).await;
         let health = client.get_health().await.unwrap();
         assert_eq!(health.len(), 3);
-        assert_eq!(health[0].wan_ip.as_deref(), Some("81.172.153.156"));
+        assert_eq!(health[0].wan_ip.as_deref(), Some("203.0.113.156"));
         assert_eq!(health[1].num_ap, Some(3));
         assert_eq!(health[2].num_switches, Some(4));
     }
@@ -495,6 +698,31 @@ mod client_api {
         let client = mock_client(&server).await;
         let err = client.get_sysinfo().await.unwrap_err();
         assert!(err.to_string().contains("No sysinfo returned"));
+    }
+
+    #[tokio::test]
+    async fn list_all_device_ports_returns_every_device() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"mac": "aa:bb:cc:dd:ee:ff", "name": "SwitchA",
+                     "port_table": [{"port_idx": 1, "port_poe": true}]},
+                    {"mac": "11:22:33:44:55:66", "name": "SwitchB",
+                     "port_table": [{"port_idx": 1}, {"port_idx": 2}]}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let devices = client.list_all_device_ports().await.unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[1].port_table.len(), 2);
     }
 }
 
@@ -650,8 +878,8 @@ mod error_handling {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"_id": "c1", "mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.1", "name": "Desktop", "is_wired": true, "tx_bytes": 1000000, "rx_bytes": 2000000},
-                    {"_id": "c2", "mac": "11:22:33:44:55:66", "ip": "10.0.0.2", "hostname": "phone", "is_wired": false, "tx_bytes": 500, "rx_bytes": 300}
+                    {"_id": "c1", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.0.2.1", "name": "Desktop", "is_wired": true, "tx_bytes": 1000000, "rx_bytes": 2000000},
+                    {"_id": "c2", "mac": "11:22:33:44:55:66", "ip": "192.0.2.2", "hostname": "phone", "is_wired": false, "tx_bytes": 500, "rx_bytes": 300}
                 ]
             })))
             .mount(&server)
@@ -673,7 +901,7 @@ mod error_handling {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "mac": "9c:05:d6:bc:06:43", "name": "USW-24-PoE",
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
                     "model": "USW-24-PoE",
                     "port_table": [
                         {"port_idx": 1, "name": "Port 1", "media": "GE", "up": true, "speed": 1000, "full_duplex": true, "poe_enable": true, "poe_power": 5.2, "port_poe": true, "tx_bytes": 123456, "rx_bytes": 654321},
@@ -685,7 +913,7 @@ mod error_handling {
             .await;
 
         let client = mock_client(&server).await;
-        let device = client.get_device_ports("9c:05:d6:bc:06:43").await.unwrap();
+        let device = client.get_device_ports("aa:bb:cc:dd:06:43").await.unwrap();
         assert_eq!(device.port_table.len(), 2);
         assert!(device.port_table[0].up);
         assert!(!device.port_table[1].up);
@@ -846,8 +1074,8 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "offset": 0, "limit": 200, "count": 2, "totalCount": 2,
                 "data": [
-                    {"macAddress": "aa:bb:cc:dd:ee:ff", "ipAddress": "10.0.0.1", "name": "Device1", "type": "WIRED"},
-                    {"macAddress": "11:22:33:44:55:66", "ipAddress": "10.0.0.2", "hostname": "host2", "type": "WIRELESS"}
+                    {"macAddress": "aa:bb:cc:dd:ee:ff", "ipAddress": "192.0.2.1", "name": "Device1", "type": "WIRED"},
+                    {"macAddress": "11:22:33:44:55:66", "ipAddress": "192.0.2.2", "hostname": "host2", "type": "WIRELESS"}
                 ]
             })))
             .mount(server)
@@ -858,9 +1086,9 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"_id": "1", "mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.99",
+                    {"_id": "1", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.0.2.99",
                      "is_wired": true, "network": "Default", "vlan": 1},
-                    {"_id": "2", "mac": "11:22:33:44:55:66", "essid": "Notwork",
+                    {"_id": "2", "mac": "11:22:33:44:55:66", "essid": "GuestNet",
                      "signal": -55, "uptime": 100, "network": "IoT", "vlan": 20}
                 ]
             })))
@@ -928,7 +1156,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "_id": "abc", "mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.1",
+                    "_id": "abc", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.0.2.1",
                     "name": "WiredDevice", "is_wired": true, "uptime": 86400,
                     "tx_bytes": 1048576, "rx_bytes": 2097152
                 }]
@@ -950,10 +1178,10 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "_id": "def", "mac": "11:22:33:44:55:66", "ip": "10.0.0.2",
+                    "_id": "def", "mac": "11:22:33:44:55:66", "ip": "192.0.2.2",
                     "name": "WirelessDevice", "is_wired": false, "uptime": 3600,
                     "tx_bytes": 512000, "rx_bytes": 1024000,
-                    "signal": -55, "essid": "Notwork", "ap_mac": "60:22:32:58:b8:00"
+                    "signal": -55, "essid": "GuestNet", "ap_mac": "aa:bb:cc:dd:b8:00"
                 }]
             })))
             .mount(&server)
@@ -973,7 +1201,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "_id": "abc", "mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.1",
+                    "_id": "abc", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.0.2.1",
                     "name": "Device", "is_wired": true
                 }]
             })))
@@ -1010,7 +1238,7 @@ mod command_output {
         unifi_cli::commands::clients::set_fixed_ip(
             &client,
             "aa:bb:cc:dd:ee:ff",
-            "10.0.0.50",
+            "192.0.2.50",
             None,
             out_table(),
         )
@@ -1042,7 +1270,7 @@ mod command_output {
         unifi_cli::commands::clients::set_fixed_ip(
             &client,
             "aa:bb:cc:dd:ee:ff",
-            "10.0.0.50",
+            "192.0.2.50",
             Some("MyDevice"),
             out_table(),
         )
@@ -1112,7 +1340,7 @@ mod command_output {
             .and(path_regex(r"/proxy/network/integration/v1/sites/.*/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "offset": 0, "limit": 200, "count": 1, "totalCount": 1,
-                "data": [{"macAddress": "9c:05:d6:bc:06:43", "ipAddress": "192.168.1.1", "name": "UCG Ultra", "model": "UCG Ultra", "state": "ONLINE", "firmwareVersion": "5.0.12"}]
+                "data": [{"macAddress": "aa:bb:cc:dd:06:43", "ipAddress": "198.51.100.1", "name": "UCG Ultra", "model": "UCG Ultra", "state": "ONLINE", "firmwareVersion": "5.0.12"}]
             })))
             .mount(&server)
             .await;
@@ -1136,7 +1364,7 @@ mod command_output {
             .and(path_regex(r"/proxy/network/integration/v1/sites/.*/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "offset": 0, "limit": 200, "count": 1, "totalCount": 1,
-                "data": [{"macAddress": "9c:05:d6:bc:06:43", "name": "UCG Ultra", "model": "UCG Ultra", "state": "ONLINE", "firmwareVersion": "5.0.12"}]
+                "data": [{"macAddress": "aa:bb:cc:dd:06:43", "name": "UCG Ultra", "model": "UCG Ultra", "state": "ONLINE", "firmwareVersion": "5.0.12"}]
             })))
             .mount(&server)
             .await;
@@ -1262,7 +1490,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"subsystem": "wan", "status": "ok", "wan_ip": "1.2.3.4", "isp_name": "ISP"},
+                    {"subsystem": "wan", "status": "ok", "wan_ip": "203.0.113.4", "isp_name": "ISP"},
                     {"subsystem": "wlan", "status": "ok", "num_ap": 2, "num_sta": 10},
                     {"subsystem": "lan", "status": "ok", "num_sw": 3, "num_sta": 5},
                     {"subsystem": "vpn", "status": "unknown"}
@@ -1285,7 +1513,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"subsystem": "wan", "status": "ok", "wan_ip": "1.2.3.4", "isp_name": "ISP"}
+                    {"subsystem": "wan", "status": "ok", "wan_ip": "203.0.113.4", "isp_name": "ISP"}
                 ]
             })))
             .mount(&server)
@@ -1359,7 +1587,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "mac": "9c:05:d6:bc:06:43", "ip": "192.168.1.1",
+                    "mac": "aa:bb:cc:dd:06:43", "ip": "198.51.100.1",
                     "name": "UCG Ultra", "model": "UCG Ultra",
                     "state": 1, "version": "5.0.12", "uptime": 86400, "num_sta": 42
                 }]
@@ -1368,7 +1596,7 @@ mod command_output {
             .await;
 
         let client = mock_client(&server).await;
-        unifi_cli::commands::devices::show(&client, "9c:05:d6:bc:06:43", out_table())
+        unifi_cli::commands::devices::show(&client, "aa:bb:cc:dd:06:43", out_table())
             .await
             .unwrap();
     }
@@ -1381,7 +1609,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "mac": "9c:05:d6:bc:06:43", "ip": "192.168.1.1",
+                    "mac": "aa:bb:cc:dd:06:43", "ip": "198.51.100.1",
                     "name": "UCG Ultra", "model": "UCG Ultra",
                     "state": 1, "version": "5.0.12"
                 }]
@@ -1390,7 +1618,7 @@ mod command_output {
             .await;
 
         let client = mock_client(&server).await;
-        unifi_cli::commands::devices::show(&client, "9c:05:d6:bc:06:43", out_json())
+        unifi_cli::commands::devices::show(&client, "aa:bb:cc:dd:06:43", out_json())
             .await
             .unwrap();
     }
@@ -1581,9 +1809,9 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"_id": "c1", "mac": "aa:bb:cc:dd:ee:01", "ip": "10.0.0.1", "name": "Heavy User", "is_wired": true, "tx_bytes": 5000000000_u64, "rx_bytes": 10000000000_u64},
-                    {"_id": "c2", "mac": "aa:bb:cc:dd:ee:02", "ip": "10.0.0.2", "name": "Light User", "is_wired": false, "tx_bytes": 1000, "rx_bytes": 2000},
-                    {"_id": "c3", "mac": "aa:bb:cc:dd:ee:03", "ip": "10.0.0.3", "hostname": "medium-host", "is_wired": true, "tx_bytes": 500000, "rx_bytes": 600000}
+                    {"_id": "c1", "mac": "aa:bb:cc:dd:ee:01", "ip": "192.0.2.1", "name": "Heavy User", "is_wired": true, "tx_bytes": 5000000000_u64, "rx_bytes": 10000000000_u64},
+                    {"_id": "c2", "mac": "aa:bb:cc:dd:ee:02", "ip": "192.0.2.2", "name": "Light User", "is_wired": false, "tx_bytes": 1000, "rx_bytes": 2000},
+                    {"_id": "c3", "mac": "aa:bb:cc:dd:ee:03", "ip": "192.0.2.3", "hostname": "medium-host", "is_wired": true, "tx_bytes": 500000, "rx_bytes": 600000}
                 ]
             })))
             .mount(&server)
@@ -1603,7 +1831,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [
-                    {"_id": "c1", "mac": "aa:bb:cc:dd:ee:01", "ip": "10.0.0.1", "name": "User1", "is_wired": true, "tx_bytes": 100, "rx_bytes": 200}
+                    {"_id": "c1", "mac": "aa:bb:cc:dd:ee:01", "ip": "192.0.2.1", "name": "User1", "is_wired": true, "tx_bytes": 100, "rx_bytes": 200}
                 ]
             })))
             .mount(&server)
@@ -1625,7 +1853,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "mac": "9c:05:d6:bc:06:43", "name": "USW-24-PoE", "model": "USW-24-PoE",
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE", "model": "USW-24-PoE",
                     "port_table": [
                         {"port_idx": 1, "name": "Port 1", "media": "GE", "up": true, "speed": 1000, "full_duplex": true, "poe_enable": true, "poe_power": 5.2, "port_poe": true, "tx_bytes": 123456789, "rx_bytes": 987654321},
                         {"port_idx": 2, "name": "Port 2", "media": "GE", "up": true, "speed": 100, "full_duplex": false, "poe_enable": false, "port_poe": true, "tx_bytes": 1000, "rx_bytes": 2000},
@@ -1637,7 +1865,7 @@ mod command_output {
             .await;
 
         let client = mock_client(&server).await;
-        unifi_cli::commands::devices::ports(&client, "9c:05:d6:bc:06:43", out_table())
+        unifi_cli::commands::devices::ports(&client, "aa:bb:cc:dd:06:43", out_table())
             .await
             .unwrap();
     }
@@ -1650,7 +1878,7 @@ mod command_output {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": {"rc": "ok"},
                 "data": [{
-                    "mac": "9c:05:d6:bc:06:43", "name": "USW-Lite-8",
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-Lite-8",
                     "port_table": [
                         {"port_idx": 1, "name": "Port 1", "media": "GE", "up": true, "speed": 1000, "full_duplex": true, "poe_enable": true, "poe_power": 3.8, "port_poe": true, "tx_bytes": 100, "rx_bytes": 200}
                     ]
@@ -1660,7 +1888,7 @@ mod command_output {
             .await;
 
         let client = mock_client(&server).await;
-        unifi_cli::commands::devices::ports(&client, "9c:05:d6:bc:06:43", out_json())
+        unifi_cli::commands::devices::ports(&client, "aa:bb:cc:dd:06:43", out_json())
             .await
             .unwrap();
     }
@@ -1739,6 +1967,1779 @@ mod command_output {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Not found"));
+    }
+
+    // `devices::ports` used to derive its own `name -> model -> "Device"`
+    // device-label fallback; routing it through the shared `collect_rows`
+    // silently changed the fallback to "-" for a device with neither `name`
+    // nor `model`, and nothing caught it. Drives the real binary (JSON is
+    // easiest to assert on) so the regression is locked in at the command
+    // level, not just in the `collect_rows_with_fallback` unit test in
+    // `src/commands/ports.rs`.
+    #[tokio::test]
+    async fn devices_ports_falls_back_to_device_label_when_name_and_model_absent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:ee:ff",
+                    "port_table": [{"port_idx": 1}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "devices",
+                "ports",
+                "aa:bb:cc:dd:ee:ff",
+                "-o",
+                "json",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "devices ports failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let items = body
+            .as_array()
+            .expect("devices ports must emit a bare JSON array");
+        assert_eq!(
+            items[0]["device_name"], "Device",
+            "devices ports must keep its historical \"Device\" fallback, not \"-\": {items:?}"
+        );
+    }
+
+    // --- Ports show (single-port detail) ---
+
+    #[tokio::test]
+    async fn ports_show_table() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [
+                        {"port_idx": 1, "name": "Port 1", "media": "GE", "up": true},
+                        {
+                            "port_idx": 5, "name": "Port 5", "media": "GE", "up": true,
+                            "speed": 1000, "full_duplex": true, "autoneg": true, "enable": true,
+                            "is_uplink": false, "stp_state": "forwarding",
+                            "port_poe": true, "poe_enable": true, "poe_mode": "auto",
+                            "poe_class": "4", "poe_power": 5.2, "poe_voltage": 53.5,
+                            "poe_current": 120.3, "poe_good": true,
+                            "last_connection": {"mac": "aabbccddeeff", "connected": true},
+                            "tx_bytes": 100, "rx_bytes": 200, "tx_errors": 0, "rx_errors": 2
+                        }
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        unifi_cli::commands::ports::show(&client, "aa:bb:cc:dd:06:43", 5, out_table())
+            .await
+            .unwrap();
+    }
+
+    // `ports_show_table` above only smoke-tests that the text branch does not
+    // panic. The text branch carries real formatting logic (speed_cell,
+    // poe_cell, voltage/current, the attached MAC), so it also gets a test that
+    // spawns the real binary and asserts on the rendered text.
+    #[tokio::test]
+    async fn ports_show_text_output_renders_expected_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [{
+                        "port_idx": 5, "name": "Port 5", "media": "GE", "up": true,
+                        "speed": 1000, "full_duplex": true,
+                        "port_poe": true, "poe_enable": true, "poe_mode": "auto",
+                        "poe_class": "4", "poe_power": 5.2, "poe_voltage": 53.5,
+                        "poe_current": 120.3,
+                        "last_connection": {"mac": "aabbccddeeff", "connected": true}
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "show",
+                "aa:bb:cc:dd:06:43",
+                "5",
+                "--output",
+                "text",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "ports show failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("Port 5 on USW-24-PoE (aa:bb:cc:dd:06:43)"),
+            "title line: {text}"
+        );
+        assert!(text.contains("Port 5"), "port name: {text}");
+        assert!(text.contains("1000FD"), "speed+duplex formatting: {text}");
+        assert!(text.contains("GE"), "media: {text}");
+        assert!(text.contains("5.2W"), "PoE wattage: {text}");
+        assert!(text.contains("auto"), "PoE mode: {text}");
+        assert!(text.contains("53.50 V"), "PoE voltage: {text}");
+        assert!(text.contains("120.30 mA"), "PoE current: {text}");
+        assert!(text.contains("aa:bb:cc:dd:ee:ff"), "attached MAC: {text}");
+    }
+
+    // Drives the real `unifi` binary so the JSON this command actually prints
+    // can be inspected, and cross-checks it against what `unifi schema`
+    // publishes for "ports show": the two are supposed to be the same
+    // contract, and nothing else in this suite would catch them drifting
+    // apart.
+    #[tokio::test]
+    async fn ports_show_json_matches_schema_output_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [{
+                        "port_idx": 5, "name": "Port 5", "media": "GE", "up": true,
+                        "speed": 1000, "full_duplex": true, "autoneg": true, "enable": true,
+                        "is_uplink": false, "stp_state": "forwarding",
+                        "port_poe": true, "poe_enable": true, "poe_mode": "auto",
+                        "poe_class": "4", "poe_power": 5.2, "poe_voltage": 53.5,
+                        "poe_current": 120.3, "poe_good": true,
+                        "last_connection": {"mac": "aabbccddeeff", "connected": true},
+                        "tx_bytes": 100, "rx_bytes": 200, "tx_errors": 0, "rx_errors": 2
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "show",
+                "aa:bb:cc:dd:06:43",
+                "5",
+                "--output",
+                "json",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "ports show failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+            panic!(
+                "stdout was not valid JSON ({e}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+        let obj = body
+            .as_object()
+            .expect("ports show must emit a JSON object");
+
+        // Values that were previously fetched and thrown away.
+        assert_eq!(obj["device_mac"], "aa:bb:cc:dd:06:43");
+        assert_eq!(obj["port_idx"], 5);
+        assert_eq!(obj["poe_mode"], "auto");
+        assert_eq!(obj["poe_class"], "4");
+        assert_eq!(obj["poe_voltage"], 53.5);
+        assert_eq!(obj["poe_current"], 120.3);
+        assert_eq!(obj["poe_good"], true);
+        assert_eq!(
+            obj["attached_mac"], "aa:bb:cc:dd:ee:ff",
+            "attached_mac must be read from last_connection.mac and formatted"
+        );
+        assert_eq!(obj["tx_errors"], 0);
+        assert_eq!(obj["rx_errors"], 2);
+
+        crate::assert_schema_matches("ports show", &body);
+    }
+
+    // `autoneg`/`enable`/`is_uplink`/`poe_good` are tri-state: a firmware that
+    // omits the key must serialize as JSON null, not fall back to `false`,
+    // since a missing key must not read as a confident "disabled". Likewise
+    // `attached_mac` must be null when no device has ever linked to the port.
+    #[tokio::test]
+    async fn ports_show_omitted_tri_state_fields_serialize_as_null() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:ee:ff", "name": "USW-Lite-8",
+                    "port_table": [
+                        {"port_idx": 3, "name": "Port 3", "media": "GE", "up": false}
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "show",
+                "aa:bb:cc:dd:ee:ff",
+                "3",
+                "--output",
+                "json",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(output.status.success());
+
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for field in ["autoneg", "enable", "is_uplink", "poe_good", "attached_mac"] {
+            assert!(
+                body[field].is_null(),
+                "{field} must be null when firmware omits it, not false: {body}"
+            );
+        }
+    }
+
+    // A `last_connection` the controller has marked `connected: false` is
+    // history, not an attachment: the device may have been unplugged months
+    // ago. Reporting it as attached would tell an operator a port is in use
+    // moments before they cut its power, so `attached_mac` must be null and the
+    // MAC must survive only as `attached_last_seen_mac`.
+    #[tokio::test]
+    async fn ports_show_reports_a_stale_last_connection_as_unattached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [{
+                        "port_idx": 5, "name": "Port 5", "media": "GE", "up": false,
+                        "port_poe": true, "poe_enable": true, "poe_mode": "auto",
+                        "last_connection": {"mac": "aabbccddeeff", "connected": false}
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let run = |format: &str| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+                .args([
+                    "--host",
+                    &server.uri(),
+                    "--api-key",
+                    "test-key",
+                    "ports",
+                    "show",
+                    "aa:bb:cc:dd:06:43",
+                    "5",
+                    "--output",
+                    format,
+                ])
+                .output()
+                .expect("failed to run the unifi binary")
+        };
+
+        let json_out = run("json");
+        assert!(
+            json_out.status.success(),
+            "ports show failed: {}",
+            String::from_utf8_lossy(&json_out.stderr)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+        assert!(
+            body["attached_mac"].is_null(),
+            "a stale last_connection must not be published as attached: {body}"
+        );
+        assert_eq!(
+            body["attached_last_seen_mac"], "aa:bb:cc:dd:ee:ff",
+            "the stale MAC must stay available as history: {body}"
+        );
+        assert_eq!(
+            body["attached_connected"], false,
+            "the controller's own flag must be reported as it stands: {body}"
+        );
+
+        let text_out = run("text");
+        assert!(text_out.status.success());
+        let text = String::from_utf8_lossy(&text_out.stdout);
+        assert!(
+            text.contains("- (last seen aa:bb:cc:dd:ee:ff)"),
+            "the text branch must qualify a stale MAC rather than print it bare: {text}"
+        );
+    }
+
+    // A firmware that reports `last_connection.mac` without a `connected` flag
+    // has said nothing about the present, which is not the same fact as
+    // "disconnected". It is still not grounds to claim an attachment, so
+    // `attached_mac` stays null, but the tri-state `attached_connected` and the
+    // text output both distinguish "not reported" from "gone".
+    #[tokio::test]
+    async fn ports_show_distinguishes_an_unreported_connection_from_a_stale_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [{
+                        "port_idx": 5, "name": "Port 5", "media": "GE", "up": true,
+                        "last_connection": {"mac": "aabbccddeeff"}
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let run = |format: &str| {
+            std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+                .args([
+                    "--host",
+                    &server.uri(),
+                    "--api-key",
+                    "test-key",
+                    "ports",
+                    "show",
+                    "aa:bb:cc:dd:06:43",
+                    "5",
+                    "--output",
+                    format,
+                ])
+                .output()
+                .expect("failed to run the unifi binary")
+        };
+
+        let json_out = run("json");
+        assert!(json_out.status.success());
+        let body: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+        assert!(
+            body["attached_mac"].is_null(),
+            "an unreported connection must not be claimed as attached: {body}"
+        );
+        assert!(
+            body["attached_connected"].is_null(),
+            "a missing connected flag must stay null, not become false: {body}"
+        );
+        assert_eq!(body["attached_last_seen_mac"], "aa:bb:cc:dd:ee:ff");
+
+        let text = String::from_utf8_lossy(&run("text").stdout).to_string();
+        assert!(
+            text.contains("unknown (last seen aa:bb:cc:dd:ee:ff)"),
+            "the text branch must say the state is unknown, not that the device is gone: {text}"
+        );
+    }
+
+    // Locates `unifi ports cycle <MAC> 99` uses the same `find_port` lookup;
+    // a bogus port index must be reported as not-found (exit 4) rather than
+    // firing a command at the controller for a port that does not exist.
+    #[tokio::test]
+    async fn ports_show_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:ee:ff", "name": "USW-Lite-8",
+                    "port_table": [{"port_idx": 1}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "show",
+                "aa:bb:cc:dd:ee:ff",
+                "99",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "a nonexistent port must exit 4 (not found), got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Not found"),
+            "stderr must explain the port was not found: {stderr}"
+        );
+    }
+
+    // The row-count trailer must read "1 port" for a single row and "N ports"
+    // otherwise. Spawns the real binary (rather than calling `render_text`
+    // in-process) so this observes literal stderr text, the same surface an
+    // operator actually reads.
+    #[tokio::test]
+    async fn ports_list_trailer_is_singular_for_exactly_one_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{"mac": "aa:bb:cc:dd:ee:01", "name": "SwitchA",
+                          "port_table": [{"port_idx": 1}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "list",
+                "--output",
+                "text",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "ports list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.trim_end().ends_with("1 port"),
+            "a single row must be reported as \"1 port\", not \"1 ports\": {stderr:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ports_list_trailer_is_plural_for_multiple_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{"mac": "aa:bb:cc:dd:ee:01", "name": "SwitchA",
+                          "port_table": [{"port_idx": 1}, {"port_idx": 2}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "list",
+                "--output",
+                "text",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "ports list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.trim_end().ends_with("2 ports"),
+            "two rows must be reported as \"2 ports\": {stderr:?}"
+        );
+    }
+
+    // --- Ports list (top-level) ---
+    //
+    // Drives the real `unifi` binary against a wiremock server so the JSON
+    // envelope it actually prints can be inspected. A regression that computed
+    // `total` from the truncated page (instead of the full flattened result)
+    // would let an agent mistake a partial page for a complete one, so this
+    // must observe real stdout rather than call `commands::ports::list`
+    // in-process and only check that it returns `Ok`.
+    #[tokio::test]
+    async fn ports_list_pagination_reports_full_total_and_truncated_items() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"mac": "aa:bb:cc:dd:ee:01", "name": "SwitchA",
+                     "port_table": [{"port_idx": 1}, {"port_idx": 2}]},
+                    {"mac": "aa:bb:cc:dd:ee:02", "name": "SwitchB",
+                     "port_table": [{"port_idx": 1}, {"port_idx": 2}, {"port_idx": 3}]}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "list",
+                "--output",
+                "json",
+                "--limit",
+                "3",
+                "--offset",
+                "1",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+
+        assert!(
+            output.status.success(),
+            "ports list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+            panic!(
+                "stdout was not valid JSON ({e}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+
+        let items = body["items"]
+            .as_array()
+            .expect("envelope must have an items array");
+        assert_eq!(
+            items.len(),
+            3,
+            "the page must be truncated to the requested limit"
+        );
+        assert_eq!(
+            body["total"], 5,
+            "total must reflect every port across every device, not just this page"
+        );
+        assert_ne!(
+            body["total"].as_u64().unwrap(),
+            items.len() as u64,
+            "an agent must be able to tell a truncated page from a complete result"
+        );
+        assert_eq!(body["limit"], 3);
+        assert_eq!(body["offset"], 1);
+    }
+
+    // `render_text`'s Device column width used to be derived from whatever
+    // page it was handed, which for `ports list` is the already-paginated
+    // page. Two `--offset` pages of the same query could then render the
+    // column at different widths. The device names below are chosen so the
+    // longest one falls on the second page only; if the width regressed back
+    // to being page-local, the two headers would render at different widths
+    // and this comparison would fail.
+    #[tokio::test]
+    async fn ports_list_device_column_width_is_stable_across_pages() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"mac": "aa:bb:cc:dd:ee:01", "name": "SwitchA",
+                     "port_table": [{"port_idx": 1}, {"port_idx": 2}]},
+                    {"mac": "aa:bb:cc:dd:ee:02", "name": "A-Very-Long-Switch-Name",
+                     "port_table": [{"port_idx": 1}]}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let run_text = |limit: &str, offset: &str| -> String {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+                .args([
+                    "--host",
+                    &server.uri(),
+                    "--api-key",
+                    "test-key",
+                    "ports",
+                    "list",
+                    "--output",
+                    "text",
+                    "--limit",
+                    limit,
+                    "--offset",
+                    offset,
+                ])
+                .output()
+                .expect("failed to run the unifi binary");
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        // Page 1: only SwitchA's two ports (the long name lives on page 2).
+        let page1 = run_text("2", "0");
+        // Page 2: only the long-named device's one port.
+        let page2 = run_text("1", "2");
+
+        fn header(s: &str) -> &str {
+            s.lines()
+                .find(|l| l.contains("Device"))
+                .expect("text output must have a header row containing \"Device\"")
+        }
+        assert_eq!(
+            header(&page1),
+            header(&page2),
+            "the Device column width must come from the full result set, not the page, \
+             so two --offset pages of the same query render an identical header:\n\
+             page1: {page1}\npage2: {page2}"
+        );
+    }
+
+    // `devices ports <MAC>` is documented as an alias for `ports list <MAC>`
+    // that deliberately keeps the historical bare JSON array shape, while
+    // `ports list` emits the paginated `{items,total,limit,offset}` envelope.
+    // Wrapping `devices ports` in the envelope would break any consumer that
+    // indexes the top level, which the design explicitly forbids.
+    //
+    // Nothing else in this suite would catch that regression: the in-process
+    // `devices_ports_*` tests above only `.unwrap()`/`.unwrap_err()` and never
+    // capture stdout, and `devices_ports_and_ports_list_are_the_same_command`
+    // in `tests/cli_contract.rs` only asserts the exit code isn't a usage
+    // error. So this spawns the real compiled binary against a wiremock
+    // server (same pattern as `ports_list_pagination_reports_full_total_and_truncated_items`
+    // above) and parses actual stdout as JSON to assert on shape.
+    #[tokio::test]
+    async fn devices_ports_bare_array_vs_ports_list_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [
+                        {"port_idx": 1, "name": "Port 1", "media": "GE", "up": true, "speed": 1000, "full_duplex": true, "poe_enable": true, "poe_power": 5.2, "port_poe": true, "tx_bytes": 123456789, "rx_bytes": 987654321},
+                        {"port_idx": 2, "name": "Port 2", "media": "GE", "up": true, "speed": 100, "full_duplex": false, "poe_enable": false, "port_poe": true, "tx_bytes": 1000, "rx_bytes": 2000}
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let run_json = |args: &[&str]| -> serde_json::Value {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+                .args(["--host", &server.uri(), "--api-key", "test-key"])
+                .args(args)
+                .output()
+                .expect("failed to run the unifi binary");
+            assert!(
+                output.status.success(),
+                "{args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "{args:?} stdout was not valid JSON ({e}): {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            })
+        };
+
+        let alias = run_json(&["devices", "ports", "aa:bb:cc:dd:06:43", "-o", "json"]);
+        let canonical = run_json(&["ports", "list", "aa:bb:cc:dd:06:43", "-o", "json"]);
+
+        // 1. `devices ports` must be a bare array, and rows must carry the
+        //    device_mac/device_name fields shared with `ports list`.
+        let alias_items = alias
+            .as_array()
+            .unwrap_or_else(|| panic!("devices ports must emit a bare JSON array, got: {alias}"));
+        assert!(
+            !alias_items.is_empty(),
+            "expected at least one port row from devices ports"
+        );
+        let alias_row = alias_items[0]
+            .as_object()
+            .expect("devices ports row must be a JSON object");
+        assert!(
+            alias_row.contains_key("device_mac"),
+            "devices ports row must carry device_mac: {alias_row:?}"
+        );
+        assert!(
+            alias_row.contains_key("device_name"),
+            "devices ports row must carry device_name: {alias_row:?}"
+        );
+
+        // 2. `ports list` must be the {items,total,limit,offset} envelope.
+        assert!(
+            canonical.is_object(),
+            "ports list must emit an {{items,total,limit,offset}} envelope object, got: {canonical}"
+        );
+        let items = canonical["items"]
+            .as_array()
+            .expect("ports list envelope must have an items array");
+        assert!(
+            canonical.get("total").is_some(),
+            "ports list envelope must have a total field"
+        );
+        assert!(
+            canonical.get("limit").is_some(),
+            "ports list envelope must have a limit field"
+        );
+        assert!(
+            canonical.get("offset").is_some(),
+            "ports list envelope must have an offset field"
+        );
+        assert!(
+            !items.is_empty(),
+            "expected at least one port row from ports list"
+        );
+
+        // 3. The two spellings must carry the same key set per row, locking
+        //    in the shared-field-set property alongside the envelope split.
+        let mut alias_keys: Vec<&str> = alias_row.keys().map(String::as_str).collect();
+        alias_keys.sort_unstable();
+        let mut canonical_keys: Vec<&str> = items[0]
+            .as_object()
+            .expect("ports list row must be a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        canonical_keys.sort_unstable();
+
+        assert_eq!(
+            alias_keys, canonical_keys,
+            "devices ports and ports list must share the same per-row field set"
+        );
+    }
+
+    // --- Ports find (reverse lookup) ---
+
+    // A MAC identifier must resolve locally so the common scripted path stays
+    // a single round trip; mounting `/stat/sta` with `.expect(0)` turns an
+    // accidental client-list fetch into a test failure instead of a silent,
+    // unnoticed second request. This also locks in connected-first sorting
+    // and the exact `PORTS_FIND` field set end to end, through the real
+    // binary and JSON output, not just the in-process helpers.
+    #[tokio::test]
+    async fn ports_find_by_mac_sorts_connected_first_and_skips_client_lookup() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [
+                        {"port_idx": 2, "last_connection": {"mac": "aa:bb:cc:dd:ee:10", "connected": false}},
+                        {"port_idx": 7, "last_connection": {"mac": "aa:bb:cc:dd:ee:10", "connected": true}},
+                        {"port_idx": 9, "last_connection": {"mac": "11:22:33:44:55:66", "connected": true}}
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/sta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"}, "data": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "find",
+                "aa:bb:cc:dd:ee:10",
+                "-o",
+                "json",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "ports find failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+            panic!(
+                "stdout was not valid JSON ({e}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+        let items = body
+            .as_array()
+            .expect("ports find must emit a bare JSON array, like `networks list`");
+        assert_eq!(items.len(), 2, "the device appears on two ports");
+        assert_eq!(
+            items[0]["port_idx"], 7,
+            "the connected port must sort first"
+        );
+        assert_eq!(items[0]["connected"], true);
+        assert_eq!(items[1]["port_idx"], 2, "the stale record sorts last");
+        assert_eq!(items[1]["connected"], false);
+
+        let mut emitted: Vec<&str> = items[0]
+            .as_object()
+            .expect("row must be a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        emitted.sort_unstable();
+        let mut declared: Vec<&str> = unifi_cli::fields::names(unifi_cli::fields::PORTS_FIND);
+        declared.sort_unstable();
+        assert_eq!(
+            emitted, declared,
+            "ports find rows must carry exactly the PORTS_FIND field set"
+        );
+    }
+
+    // Ambiguity is judged by port occupancy, not by how many client records a
+    // name matches: `office` genuinely matches two devices here, and both
+    // are actually attached to a switch port (unlike the "one interface
+    // never shows up" fixtures below), so this must still exit 6 (conflict)
+    // and name both candidates. Modeled on a live-controller case: two
+    // physically distinct office devices sharing a name on the same switch.
+    #[tokio::test]
+    async fn ports_find_ambiguous_name_exits_with_conflict() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/sta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"_id": "1", "mac": "aa:bb:cc:dd:ee:20", "name": "office-ap", "ip": "192.0.2.6"},
+                    {"_id": "2", "mac": "aa:bb:cc:dd:ee:21", "name": "Main-Office", "ip": "192.0.2.7"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW Pro XG 8 PoE",
+                    "port_table": [
+                        {"port_idx": 3, "last_connection": {"mac": "aa:bb:cc:dd:ee:20", "connected": true}},
+                        {"port_idx": 4, "last_connection": {"mac": "aa:bb:cc:dd:ee:21", "connected": true}}
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "find",
+                "office",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "an ambiguous name must exit 6 (conflict), got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last_line = stderr.trim_end().lines().last().unwrap_or("");
+        let envelope: serde_json::Value =
+            serde_json::from_str(last_line).expect("last stderr line must be valid JSON");
+        assert_eq!(envelope["error"]["kind"], "conflict");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error envelope must carry a message");
+        assert!(message.contains("office-ap"), "got: {message}");
+        assert!(message.contains("Main-Office"), "got: {message}");
+    }
+
+    // A device whose wired and wireless interfaces share a name: `garage-pi`
+    // matches two client records (a Raspberry Pi's wired and wireless
+    // interfaces, MACs one bit apart in the last octet), but only the wired
+    // interface ever shows up in a port table. That must resolve cleanly to
+    // the one candidate that is actually on a port, not conflict.
+    #[tokio::test]
+    async fn ports_find_name_matches_two_clients_only_one_on_a_port_resolves_without_conflict() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/sta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"_id": "1", "mac": "aa:bb:cc:dd:ee:10", "name": "garage-pi", "ip": "192.0.2.5"},
+                    {"_id": "2", "mac": "aa:bb:cc:dd:ee:11", "name": "garage-pi", "ip": "192.0.2.9"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW Pro XG 8 PoE",
+                    "port_table": [
+                        {"port_idx": 5, "last_connection": {"mac": "aa:bb:cc:dd:ee:10", "connected": true}}
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "find",
+                "garage-pi",
+                "-o",
+                "json",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "ports find must resolve the single ported candidate, not conflict: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let items: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+            panic!(
+                "stdout was not valid JSON ({e}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+        let items = items
+            .as_array()
+            .expect("ports find must emit a bare JSON array");
+        assert_eq!(items.len(), 1, "only the wired interface is on a port");
+        assert_eq!(items[0]["port_idx"], 5);
+        assert_eq!(items[0]["connected"], true);
+    }
+
+    // The other client record sharing the name never appears in any port
+    // table at all: not "only the wireless interface", but no candidate on a
+    // port whatsoever, so this must be not_found, not a conflict.
+    #[tokio::test]
+    async fn ports_find_name_matches_clients_none_on_a_port_is_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/sta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"_id": "1", "mac": "aa:bb:cc:dd:ee:10", "name": "lobby-display", "ip": "192.0.2.15"},
+                    {"_id": "2", "mac": "aa:bb:cc:dd:ee:11", "name": "lobby-display", "ip": "192.0.2.16"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW Pro XG 8 PoE",
+                    "port_table": [
+                        {"port_idx": 1, "last_connection": {"mac": "11:22:33:44:55:66", "connected": true}}
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "find",
+                "lobby-display",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "neither candidate is on any port, so this must exit 4 (not_found), got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let last_line = stderr.trim_end().lines().last().unwrap_or("");
+        let envelope: serde_json::Value =
+            serde_json::from_str(last_line).expect("last stderr line must be valid JSON");
+        assert_eq!(envelope["error"]["kind"], "not_found");
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error envelope must carry a message");
+        assert!(message.contains("lobby-display"), "got: {message}");
+    }
+
+    // `find`'s JSON output has always carried `connected`; only the text
+    // table lacked it, leaving the connected-first sort order as the sole
+    // (easy-to-miss) signal for which row is the device's *current* port,
+    // a distinction that matters because this lookup feeds the destructive
+    // `ports cycle`. Two distinctly-named single-port devices (rather than
+    // one device with two ports) so each rendered row can be identified by
+    // its device name, independent of the connected-first sort this test
+    // does not itself re-verify (that is `ports_find_by_mac_sorts_connected_first_and_skips_client_lookup`'s job).
+    #[tokio::test]
+    async fn ports_find_text_output_shows_connected_column() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"mac": "aa:bb:cc:dd:ee:01", "name": "SwitchConnected",
+                     "port_table": [
+                        {"port_idx": 7, "last_connection": {"mac": "aa:bb:cc:dd:ee:10", "connected": true}}
+                     ]},
+                    {"mac": "aa:bb:cc:dd:ee:02", "name": "SwitchStale",
+                     "port_table": [
+                        {"port_idx": 2, "last_connection": {"mac": "aa:bb:cc:dd:ee:10", "connected": false}}
+                     ]}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "find",
+                "aa:bb:cc:dd:ee:10",
+                "-o",
+                "text",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "ports find failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+        let header = stdout
+            .lines()
+            .find(|l| l.contains("Device"))
+            .expect("text output must have a header row containing \"Device\"");
+        assert!(
+            header.contains("Connected"),
+            "find's header must carry a Connected column: {header}"
+        );
+
+        let connected_row = stdout
+            .lines()
+            .find(|l| l.contains("SwitchConnected"))
+            .expect("expected a row for the connected device");
+        let stale_row = stdout
+            .lines()
+            .find(|l| l.contains("SwitchStale"))
+            .expect("expected a row for the stale device");
+
+        assert!(
+            connected_row.trim_end().ends_with("yes"),
+            "the connected row's Connected column must render \"yes\": {connected_row}"
+        );
+        assert!(
+            stale_row.trim_end().ends_with('-'),
+            "the stale row's Connected column must render \"-\": {stale_row}"
+        );
+    }
+
+    // --- Ports cycle (mutation orchestration) ---
+    //
+    // `power_cycle_port_sends_correct_command` (in `client_api` above) only
+    // covers the client method's endpoint and body. Nothing exercised the
+    // orchestration in `commands::ports::cycle` that decides *whether* to call
+    // it at all, and that orchestration is the only place in this CLI that
+    // cuts power to physical hardware. These four cases pin down the guard-rail
+    // ordering (find_port -> check_cyclable -> confirm -> POST) as a tested
+    // property rather than a code-reading exercise: the `.expect(0)` mounts on
+    // decline/conflict/not-found assert, via wiremock's mount-drop
+    // verification, that no HTTP write happens on any of the three
+    // non-cycling paths.
+
+    #[tokio::test]
+    async fn ports_cycle_confirmed_cycles_the_port() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [{
+                        "port_idx": 5, "port_poe": true, "poe_mode": "auto",
+                        "poe_enable": true
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/network/api/s/default/cmd/devmgr"))
+            .and(body_json(serde_json::json!({
+                "cmd": "power-cycle",
+                "mac": "aa:bb:cc:dd:06:43",
+                "port_idx": 5
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome =
+            unifi_cli::commands::ports::cycle(&client, "aa:bb:cc:dd:06:43", 5, out_table(), |_| {
+                Ok(true)
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::CycleOutcome::Cycled);
+    }
+
+    #[tokio::test]
+    async fn ports_cycle_declined_never_posts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [{
+                        "port_idx": 5, "port_poe": true, "poe_mode": "auto",
+                        "poe_enable": true
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/network/api/s/default/cmd/devmgr"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome =
+            unifi_cli::commands::ports::cycle(&client, "aa:bb:cc:dd:06:43", 5, out_table(), |_| {
+                Ok(false)
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::CycleOutcome::Declined);
+    }
+
+    #[tokio::test]
+    async fn ports_cycle_non_poe_port_is_conflict_and_never_posts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-Lite-8",
+                    "port_table": [{"port_idx": 9, "port_poe": false}]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/network/api/s/default/cmd/devmgr"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        // The confirm callback returns `Ok(true)` deliberately: `check_cyclable`
+        // must reject before `confirm` is ever consulted, so a callback that
+        // would approve proves nothing about ordering unless it's wired to run
+        // second.
+        let err =
+            unifi_cli::commands::ports::cycle(&client, "aa:bb:cc:dd:06:43", 9, out_table(), |_| {
+                Ok(true)
+            })
+            .await
+            .unwrap_err();
+        let api_err = err
+            .downcast_ref::<unifi_cli::api::ApiError>()
+            .unwrap_or_else(|| {
+                panic!("cycle must reject a non-PoE port as an ApiError, got {err}")
+            });
+        assert!(
+            matches!(api_err, unifi_cli::api::ApiError::Conflict(_)),
+            "expected Conflict, got {api_err:?}"
+        );
+    }
+
+    // Mirrors `ports_cycle_non_poe_port_is_conflict_and_never_posts` for the
+    // third guard rail: a port that is PoE-capable and not administratively
+    // off, but that the controller reports as not currently delivering power
+    // (poe_enable: false). This is the fixture from the live UCG-Max finding
+    // that motivated the guard; see `check_cyclable` in
+    // `src/commands/ports.rs` for what was actually observed.
+    #[tokio::test]
+    async fn ports_cycle_poe_enable_false_is_conflict_and_never_posts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:ee:fe", "name": "USW Lite 8 PoE",
+                    "port_table": [{
+                        "port_idx": 4, "port_poe": true, "poe_mode": "auto",
+                        "poe_enable": false, "poe_power": 0.0, "up": false
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/network/api/s/default/cmd/devmgr"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        // `Ok(true)` deliberately, same reasoning as the non-PoE case above:
+        // proves `check_cyclable` rejects before `confirm` is ever consulted.
+        let err =
+            unifi_cli::commands::ports::cycle(&client, "aa:bb:cc:dd:ee:fe", 4, out_table(), |_| {
+                Ok(true)
+            })
+            .await
+            .unwrap_err();
+        let api_err = err
+            .downcast_ref::<unifi_cli::api::ApiError>()
+            .unwrap_or_else(|| {
+                panic!("cycle must reject a poe_enable=false port as an ApiError, got {err}")
+            });
+        assert!(
+            matches!(api_err, unifi_cli::api::ApiError::Conflict(_)),
+            "expected Conflict, got {api_err:?}"
+        );
+    }
+
+    // --- Ports poe (port_overrides merge) ---
+    //
+    // The PUT replaces the device's whole `port_overrides` array, so the body
+    // matcher asserts the exact merged list: other ports' overrides and other
+    // keys in the target entry must survive, or the switch reconfigures them.
+
+    fn poe_device_body(overrides: serde_json::Value, poe_mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "meta": {"rc": "ok"},
+            "data": [{
+                "_id": "dev123", "mac": "aa:bb:cc:dd:ee:09", "name": "USW Pro Max 24 PoE",
+                "port_table": [
+                    {"port_idx": 9, "port_poe": true, "poe_mode": poe_mode},
+                    {"port_idx": 25, "port_poe": false, "media": "SFP+"}
+                ],
+                "port_overrides": overrides
+            }]
+        })
+    }
+
+    fn fast_verify() -> unifi_cli::commands::ports::VerifyPolicy {
+        unifi_cli::commands::ports::VerifyPolicy {
+            attempts: 3,
+            delay: std::time::Duration::from_millis(10),
+        }
+    }
+
+    /// First GET answers `first`, every later GET (the post-PUT readback)
+    /// answers `then`.
+    async fn mount_device_sequence(
+        server: &MockServer,
+        first: serde_json::Value,
+        then: serde_json::Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(then))
+            .with_priority(2)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn ports_poe_put_merges_and_preserves_other_overrides() {
+        let server = MockServer::start().await;
+        let overrides = serde_json::json!([
+            {"port_idx": 1, "name": "uplink", "native_networkconf_id": "net1"},
+            {"port_idx": 9, "name": "camera", "portconf_id": "pc1", "poe_mode": "auto"},
+            {"port_idx": 17, "poe_mode": "off", "autoneg": false, "speed": 100}
+        ]);
+        mount_device_sequence(
+            &server,
+            poe_device_body(overrides.clone(), "auto"),
+            poe_device_body(overrides, "off"),
+        )
+        .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .and(body_json(serde_json::json!({"port_overrides": [
+                {"port_idx": 1, "name": "uplink", "native_networkconf_id": "net1"},
+                {"port_idx": 9, "name": "camera", "portconf_id": "pc1", "poe_mode": "off"},
+                {"port_idx": 17, "poe_mode": "off", "autoneg": false, "speed": 100}
+            ]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"}, "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let mut summary = String::new();
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "AA:BB:CC:DD:EE:09",
+            9,
+            "off",
+            out_json(),
+            fast_verify(),
+            |s| {
+                summary = s.to_string();
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Changed);
+        assert_eq!(
+            summary,
+            "Port 9 on USW Pro Max 24 PoE: PoE mode auto -> off"
+        );
+    }
+
+    #[tokio::test]
+    async fn ports_poe_inserts_override_when_port_has_none() {
+        let server = MockServer::start().await;
+        mount_device_sequence(
+            &server,
+            poe_device_body(
+                serde_json::json!([{"port_idx": 1, "name": "uplink"}]),
+                "auto",
+            ),
+            poe_device_body(serde_json::json!([]), "off"),
+        )
+        .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .and(body_json(serde_json::json!({"port_overrides": [
+                {"port_idx": 1, "name": "uplink"},
+                {"port_idx": 9, "poe_mode": "off"}
+            ]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"}, "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Changed);
+    }
+
+    #[tokio::test]
+    async fn ports_poe_override_disagrees_with_port_table_is_error_and_never_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(poe_device_body(
+                serde_json::json!([{"port_idx": 9, "poe_mode": "off", "name": "cam"}]),
+                "auto",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("poe_mode=off") && msg.contains("poe_mode=auto"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ports_poe_readback_mismatch_is_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"}, "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("accepted the change but port 9") && msg.contains("poe_mode=auto"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ports_poe_already_in_mode_never_prompts_or_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(poe_device_body(
+                serde_json::json!([{"port_idx": 9, "poe_mode": "off"}]),
+                "off",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| panic!("must not prompt when nothing changes"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn ports_poe_declined_never_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Declined);
+    }
+
+    #[tokio::test]
+    async fn ports_poe_non_poe_port_is_conflict_and_never_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            25,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<unifi_cli::api::ApiError>(),
+            Some(unifi_cli::api::ApiError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ports_poe_unknown_device_is_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "11:22:33:44:55:66",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<unifi_cli::api::ApiError>(),
+            Some(unifi_cli::api::ApiError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ports_poe_controller_error_rc_is_reported() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "error", "msg": "api.err.Invalid"}, "data": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("api.err.Invalid"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ports_cycle_missing_port_is_not_found_and_never_posts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "USW-24-PoE",
+                    "port_table": [{"port_idx": 1, "port_poe": true}]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/network/api/s/default/cmd/devmgr"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": []
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::cycle(
+            &client,
+            "aa:bb:cc:dd:06:43",
+            99,
+            out_table(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        let api_err = err
+            .downcast_ref::<unifi_cli::api::ApiError>()
+            .unwrap_or_else(|| {
+                panic!("cycle must report a missing port as an ApiError, got {err}")
+            });
+        assert!(
+            matches!(api_err, unifi_cli::api::ApiError::NotFound(_)),
+            "expected NotFound, got {api_err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1847,5 +3848,1642 @@ mod client_construction {
     fn new_with_invalid_api_key() {
         let client = unifi_cli::api::UnifiClient::new("host", "bad\nkey");
         assert!(client.is_err());
+    }
+}
+
+// --- An application the controller does not have ---
+//
+// UniFi OS does not 404 a request for an application that is not installed:
+// it proxies the request to its own web UI, which answers 200 with an HTML
+// page. Parsing that as JSON yields "error decoding response body", which
+// names neither the endpoint nor the reason, so an agent cannot tell a
+// missing application from a transport fault it should retry. These drive
+// the real binary so the published envelope and exit code are observed.
+
+mod unsupported_application {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const UNIFI_OS_SHELL: &str =
+        "<!DOCTYPE html><html><head><title>UniFi OS</title></head><body></body></html>";
+
+    fn envelope(stderr: &str) -> serde_json::Value {
+        let last_line = stderr.trim_end().lines().last().unwrap_or("");
+        serde_json::from_str(last_line)
+            .unwrap_or_else(|e| panic!("last stderr line must be valid JSON ({e}): {last_line:?}"))
+    }
+
+    #[tokio::test]
+    async fn protect_cameras_list_reports_unsupported_when_the_controller_serves_html() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/protect/integration/v1/cameras"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(UNIFI_OS_SHELL, "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "protect",
+                "cameras",
+                "list",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "an absent application must exit 4, got {:?}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope = envelope(&stderr);
+        assert_eq!(
+            envelope["error"]["kind"], "unsupported",
+            "an absent application is not a transport fault: {stderr}"
+        );
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error envelope must carry a message");
+        assert!(
+            message.contains("/proxy/protect/integration/v1/cameras"),
+            "the message must name the endpoint that answered: {message}"
+        );
+        assert!(
+            message.contains("text/html"),
+            "the message must name what it answered with: {message}"
+        );
+        assert!(
+            message.contains("Protect"),
+            "a Protect endpoint must say which application is missing: {message}"
+        );
+    }
+
+    // The same proxy behaviour on a Network endpoint. Nothing about the check
+    // is Protect-specific, but only the Protect message carries the hint, so
+    // this pins that a Network endpoint reports the kind without inventing an
+    // application that is in fact installed.
+    #[tokio::test]
+    async fn a_legacy_endpoint_answering_html_reports_unsupported_without_a_protect_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(UNIFI_OS_SHELL, "text/html; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "list",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope = envelope(&stderr);
+        assert_eq!(envelope["error"]["kind"], "unsupported");
+        let message = envelope["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("/proxy/network/api/s/default/stat/device"),
+            "the message must name the endpoint that answered: {message}"
+        );
+        assert!(
+            !message.contains("Protect"),
+            "a Network endpoint must not be blamed on Protect: {message}"
+        );
+    }
+
+    // A body that decodes is an answer, whatever the header says it is. A
+    // controller behind a proxy that rewrites or drops the content type is
+    // still serving the endpoint, so reporting it as an application the
+    // controller does not have would be worse than the error this replaced:
+    // it would name a cause that is not merely vague but wrong.
+    #[tokio::test]
+    async fn json_under_a_non_json_content_type_still_decodes() {
+        for content_type in ["text/plain", "application/octet-stream"] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/proxy/network/api/s/default/stat/device"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    r#"{"meta":{"rc":"ok"},"data":[{"mac":"aa:bb:cc:dd:ee:01","name":"SwitchA","port_table":[{"port_idx":1}]}]}"#,
+                    content_type,
+                ))
+                .mount(&server)
+                .await;
+
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+                .args([
+                    "--host",
+                    &server.uri(),
+                    "--api-key",
+                    "test-key",
+                    "ports",
+                    "list",
+                ])
+                .output()
+                .expect("failed to run the unifi binary");
+
+            assert!(
+                output.status.success(),
+                "a JSON body served as {content_type} must still decode: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|e| panic!("stdout was not JSON ({e}) for {content_type}"));
+            assert_eq!(body["items"][0]["device_name"], "SwitchA", "{content_type}");
+        }
+    }
+
+    // A malformed body from an endpoint the controller does serve is a fault
+    // in that controller, not a missing application, and must keep saying so.
+    #[tokio::test]
+    async fn a_broken_json_body_is_a_general_error_not_unsupported() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(r#"{"meta":{"rc":"ok"},"data":["#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "ports",
+                "list",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope = envelope(&stderr);
+        assert_eq!(
+            envelope["error"]["kind"], "general_error",
+            "the endpoint is served, the body is broken: {stderr}"
+        );
+        let message = envelope["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("/proxy/network/api/s/default/stat/device"),
+            "the message must still name the endpoint: {message}"
+        );
+    }
+
+    // The content-type check must not swallow a real JSON answer, including
+    // one whose type carries a suffix or a charset.
+    #[tokio::test]
+    async fn a_json_content_type_still_decodes() {
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/vnd.api+json",
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/proxy/network/api/s/default/stat/device"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(
+                    r#"{"meta":{"rc":"ok"},"data":[{"mac":"aa:bb:cc:dd:ee:01","name":"SwitchA","port_table":[{"port_idx":1}]}]}"#,
+                    content_type,
+                ))
+                .mount(&server)
+                .await;
+
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+                .args([
+                    "--host",
+                    &server.uri(),
+                    "--api-key",
+                    "test-key",
+                    "ports",
+                    "list",
+                ])
+                .output()
+                .expect("failed to run the unifi binary");
+
+            assert!(
+                output.status.success(),
+                "{content_type} must decode as JSON: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|e| panic!("stdout was not JSON ({e}) for {content_type}"));
+            assert_eq!(body["items"][0]["device_name"], "SwitchA", "{content_type}");
+        }
+    }
+}
+
+// --- An event log the firmware no longer serves ---
+//
+// UniFi Network 9 answers stat/event with 404 api.err.NotFound, and some
+// builds do not serve the rest/alarm fallback either: they reject the
+// resource with 400 api.err.InvalidObject, the same answer a nonsense
+// resource name gets. Reporting that verbatim tells a caller its request was
+// malformed and invites it to retry with other parameters, when in truth no
+// request would work. These drive the real binary so the published envelope
+// and exit code are observed.
+
+mod events_surface_removed {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn envelope(stderr: &str) -> serde_json::Value {
+        let last_line = stderr.trim_end().lines().last().unwrap_or("");
+        serde_json::from_str(last_line)
+            .unwrap_or_else(|e| panic!("last stderr line must be valid JSON ({e}): {last_line:?}"))
+    }
+
+    fn run_events_list(server: &MockServer) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                &server.uri(),
+                "--api-key",
+                "test-key",
+                "events",
+                "list",
+            ])
+            .output()
+            .expect("failed to run the unifi binary")
+    }
+
+    async fn mount_stat_event_404(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/event"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "meta": {"rc": "error", "msg": "api.err.NotFound"},
+                "data": []
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_alarm(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/rest/alarm"))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn both_endpoints_gone_reports_unsupported_not_a_rejected_request() {
+        let server = MockServer::start().await;
+        mount_stat_event_404(&server).await;
+        mount_alarm(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "meta": {"rc": "error", "msg": "api.err.InvalidObject"},
+                "data": []
+            })),
+        )
+        .await;
+
+        let output = run_events_list(&server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "an absent event surface must exit 4, not 5: {stderr}"
+        );
+        let envelope = envelope(&stderr);
+        assert_eq!(
+            envelope["error"]["kind"], "unsupported",
+            "the request was fine, the endpoint is gone: {stderr}"
+        );
+        let message = envelope["error"]["message"]
+            .as_str()
+            .expect("error envelope must carry a message");
+        assert!(
+            message.contains("/proxy/network/api/s/default/stat/event"),
+            "the message must name the endpoint the caller asked for: {message}"
+        );
+        assert!(
+            message.contains("WebSocket"),
+            "the message must say what event stream remains: {message}"
+        );
+        assert!(
+            !message.contains("instead of JSON"),
+            "this controller answered JSON, it just refused the resource: {message}"
+        );
+        assert!(
+            !message.contains("Protect"),
+            "a Network endpoint must not be blamed on Protect: {message}"
+        );
+    }
+
+    // The fallback answering 404 means the same thing as its 400: the resource
+    // is not there. Both arms must reach the same kind.
+    #[tokio::test]
+    async fn a_fallback_that_404s_reports_unsupported_too() {
+        let server = MockServer::start().await;
+        mount_stat_event_404(&server).await;
+        mount_alarm(
+            &server,
+            ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "meta": {"rc": "error", "msg": "api.err.NotFound"},
+                "data": []
+            })),
+        )
+        .await;
+
+        let output = run_events_list(&server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(4), "stderr: {stderr}");
+        assert_eq!(envelope(&stderr)["error"]["kind"], "unsupported");
+    }
+
+    // The negative control for the 400 arm. A 400 that is not the controller
+    // disowning the resource is a genuinely rejected request, and must keep
+    // saying so: turning every 400 into `unsupported` would hide real faults
+    // behind "this controller cannot do that".
+    #[tokio::test]
+    async fn a_fallback_rejecting_the_request_stays_a_client_error() {
+        let server = MockServer::start().await;
+        mount_stat_event_404(&server).await;
+        mount_alarm(
+            &server,
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "meta": {"rc": "error", "msg": "api.err.InvalidPayload"},
+                "data": []
+            })),
+        )
+        .await;
+
+        let output = run_events_list(&server);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(5),
+            "a rejected request is not an absent endpoint: {stderr}"
+        );
+        let envelope = envelope(&stderr);
+        assert_eq!(envelope["error"]["kind"], "client_error", "{stderr}");
+        let message = envelope["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("api.err.InvalidPayload"),
+            "the controller's own reason must survive: {message}"
+        );
+    }
+
+    // The positive control. A controller that does serve the fallback must
+    // still get its events, so the check above cannot be passing by refusing
+    // everything.
+    #[tokio::test]
+    async fn a_working_fallback_still_returns_events() {
+        let server = MockServer::start().await;
+        mount_stat_event_404(&server).await;
+        mount_alarm(
+            &server,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"key": "EVT_GW_Restarted", "msg": "Gateway restarted", "subsystem": "wan", "time": 300, "datetime": "2026-07-07T17:00:00Z"}
+                ]
+            })),
+        )
+        .await;
+
+        let output = run_events_list(&server);
+        assert!(
+            output.status.success(),
+            "a served fallback must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+        assert_eq!(body["items"][0]["key"], "EVT_GW_Restarted");
+    }
+}
+
+// --- Ranking clients the controller published no counters for ---
+//
+// The live controller omits tx_bytes/rx_bytes for a substantial share of the
+// clients it lists, so this is the common case rather than a corner of it.
+
+mod clients_top_unknown_counters {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// One client that transferred a lot, one that reported a real zero, and one
+    /// the controller published no counters for at all.
+    async fn serving_a_mixed_population() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/sta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [
+                    {"_id": "c1", "mac": "aa:bb:cc:dd:ee:01", "ip": "192.0.2.1",
+                     "name": "Talker", "is_wired": true,
+                     "tx_bytes": 500000, "rx_bytes": 600000},
+                    {"_id": "c2", "mac": "aa:bb:cc:dd:ee:02", "ip": "192.0.2.2",
+                     "name": "Silent", "is_wired": true},
+                    {"_id": "c3", "mac": "aa:bb:cc:dd:ee:03", "ip": "192.0.2.3",
+                     "name": "Measured Idle", "is_wired": true,
+                     "tx_bytes": 0, "rx_bytes": 0}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn run(server_uri: &str, args: &[&str]) -> std::process::Output {
+        let mut argv = vec!["--host", server_uri, "--api-key", "test-key"];
+        argv.extend_from_slice(args);
+        std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args(argv)
+            .output()
+            .expect("failed to run the unifi binary")
+    }
+
+    #[tokio::test]
+    async fn a_client_with_no_reported_counters_is_not_drawn_as_having_moved_nothing() {
+        let server = serving_a_mixed_population().await;
+        let stdout = String::from_utf8_lossy(
+            &run(
+                &server.uri(),
+                &["clients", "top", "--limit", "10", "-o", "text"],
+            )
+            .stdout,
+        )
+        .into_owned();
+
+        let silent = stdout
+            .lines()
+            .find(|l| l.contains("Silent"))
+            .unwrap_or_else(|| panic!("no row for the client without counters:\n{stdout}"));
+        assert!(
+            !silent.contains("0 B"),
+            "counters the controller never sent are unknown, and `0 B` claims a \
+             measurement nobody made: {silent}"
+        );
+
+        // The negative control: a client that really did report zero must keep
+        // saying so, or the fix has simply hidden every zero.
+        let idle = stdout
+            .lines()
+            .find(|l| l.contains("Measured Idle"))
+            .unwrap_or_else(|| panic!("no row for the idle client:\n{stdout}"));
+        assert!(
+            idle.contains("0 B"),
+            "a client that did report zero has been measured: {idle}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrankable_client_does_not_displace_one_that_can_be_ranked() {
+        let server = serving_a_mixed_population().await;
+        let stdout = String::from_utf8_lossy(
+            &run(
+                &server.uri(),
+                &["clients", "top", "--limit", "10", "-o", "text"],
+            )
+            .stdout,
+        )
+        .into_owned();
+
+        let row_of = |name: &str| {
+            stdout
+                .lines()
+                .position(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}:\n{stdout}"))
+        };
+        assert!(
+            row_of("Talker") < row_of("Measured Idle"),
+            "a ranking by traffic still ranks what it can:\n{stdout}"
+        );
+        assert!(
+            row_of("Measured Idle") < row_of("Silent"),
+            "a client that cannot be ranked belongs after every client that \
+             can, not interleaved with them:\n{stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_total_is_not_a_number_when_neither_half_is() {
+        let server = serving_a_mixed_population().await;
+        let output = run(
+            &server.uri(),
+            &["clients", "top", "--limit", "10", "-o", "json"],
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+        let items = body.as_array().expect("clients top emits an array");
+        let silent = items
+            .iter()
+            .find(|c| c["name"] == "Silent")
+            .expect("the client without counters must still be listed");
+
+        assert!(
+            silent["tx_bytes"].is_null() && silent["rx_bytes"].is_null(),
+            "{silent}"
+        );
+        assert!(
+            silent["total_bytes"].is_null(),
+            "a total of two unknowns is unknown, and `0` next to two nulls is a \
+             contradiction in one object: {silent}"
+        );
+    }
+}
+
+// --- The Protect camera surface ---
+//
+// There is no Protect application to test against, so these drive the real
+// binary against a stand-in that serves the payloads Protect's own API is
+// documented to return. That proves what the tool does with a given payload,
+// which is where every finding below lived; it does not prove which payloads
+// Protect actually sends.
+
+mod protect_cameras {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const CAMERAS_PATH: &str = "/proxy/protect/integration/v1/cameras";
+
+    fn run(server_uri: &str, args: &[&str]) -> std::process::Output {
+        let mut argv = vec!["--host", server_uri, "--api-key", "test-key"];
+        argv.extend_from_slice(args);
+        std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args(argv)
+            .output()
+            .expect("failed to run the unifi binary")
+    }
+
+    async fn serving(body: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(CAMERAS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn the_camera_list_uses_the_same_envelope_as_every_other_list() {
+        let server = serving(serde_json::json!([
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door", "state": "CONNECTED"}
+        ]))
+        .await;
+
+        let output = run(&server.uri(), &["protect", "cameras", "list", "-o", "json"]);
+        assert!(output.status.success());
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+
+        assert_eq!(
+            body["items"][0]["name"], "Front Door",
+            "a consumer reading `items` must not have to special-case cameras: {body}"
+        );
+        assert_eq!(body["total"], 1, "{body}");
+    }
+
+    // Same contract check the rest of the read-only surface gets: what the
+    // schema publishes for these commands must be what they emit.
+    #[tokio::test]
+    async fn the_camera_list_matches_the_schema_it_publishes() {
+        let server = serving(serde_json::json!([{
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door",
+            "mac": "AABBCCDDEEFF", "state": "CONNECTED", "modelKey": "camera",
+            "isMicEnabled": true, "videoMode": "default"
+        }]))
+        .await;
+
+        let output = run(&server.uri(), &["protect", "cameras", "list", "-o", "json"]);
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+        crate::assert_schema_matches("protect cameras list", &body);
+    }
+
+    #[tokio::test]
+    async fn the_camera_detail_matches_the_schema_it_publishes() {
+        let camera = serde_json::json!({
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door",
+            "mac": "AABBCCDDEEFF", "state": "CONNECTED", "modelKey": "camera",
+            "isMicEnabled": true, "videoMode": "default",
+            "featureFlags": {"hasHdr": true, "hasMic": true}
+        });
+        // The name is resolved against the listing, then the detail fetched by id.
+        let server = serving(serde_json::json!([camera])).await;
+        Mock::given(method("GET"))
+            .and(path(format!("{CAMERAS_PATH}/aaaaaaaaaaaaaaaaaaaaaaaa")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(camera))
+            .mount(&server)
+            .await;
+
+        let output = run(
+            &server.uri(),
+            &["protect", "cameras", "show", "Front Door", "-o", "json"],
+        );
+        assert!(
+            output.status.success(),
+            "cameras show failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+        crate::assert_schema_matches("protect cameras show", &body);
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_did_not_report_its_mic_is_not_reported_as_muted() {
+        let server = serving(serde_json::json!([
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door", "state": "CONNECTED"}
+        ]))
+        .await;
+
+        let output = run(&server.uri(), &["protect", "cameras", "list", "-o", "json"]);
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+
+        assert!(
+            body["items"][0]["mic_enabled"].is_null(),
+            "an unreported flag is unknown, and `false` cannot be told apart \
+             from a camera that really has its mic off: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_camera_that_reported_its_mic_still_says_so() {
+        let server = serving(serde_json::json!([
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door", "isMicEnabled": false}
+        ]))
+        .await;
+
+        let output = run(&server.uri(), &["protect", "cameras", "list", "-o", "json"]);
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+
+        assert_eq!(
+            body["items"][0]["mic_enabled"], false,
+            "a flag the camera did report must survive: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_camera_matching_a_name_resolves_to_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(CAMERAS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door"},
+                {"id": "bbbbbbbbbbbbbbbbbbbbbbbb", "name": "Back Door"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{CAMERAS_PATH}/aaaaaaaaaaaaaaaaaaaaaaaa")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door"}),
+            ))
+            .mount(&server)
+            .await;
+
+        let output = run(
+            &server.uri(),
+            &["protect", "cameras", "show", "Front Door", "-o", "json"],
+        );
+        assert!(
+            output.status.success(),
+            "an unambiguous name must resolve: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+        assert_eq!(body["id"], "aaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[tokio::test]
+    async fn a_name_two_cameras_share_is_refused_rather_than_guessed() {
+        let server = serving(serde_json::json!([
+            {"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door"},
+            {"id": "bbbbbbbbbbbbbbbbbbbbbbbb", "name": "Front Door"}
+        ]))
+        .await;
+
+        let output = run(
+            &server.uri(),
+            &["protect", "cameras", "show", "Front Door", "-o", "json"],
+        );
+
+        assert!(
+            !output.status.success(),
+            "acting on whichever camera was listed first is a silent choice \
+             the caller never made"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("aaaaaaaaaaaaaaaaaaaaaaaa")
+                && stderr.contains("bbbbbbbbbbbbbbbbbbbbbbbb"),
+            "both candidates must be named so the caller can pick one: {stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rtsps_listing_matches_the_schema_it_publishes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "{CAMERAS_PATH}/aaaaaaaaaaaaaaaaaaaaaaaa/rtsps-stream"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "high": "rtsps://192.0.2.10:7441/high",
+                "medium": "rtsps://192.0.2.10:7441/medium",
+                "low": "rtsps://192.0.2.10:7441/low",
+                "package": "rtsps://192.0.2.10:7441/package"
+            })))
+            .mount(&server)
+            .await;
+
+        let output = run(
+            &server.uri(),
+            &[
+                "protect",
+                "rtsps",
+                "list",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                "-o",
+                "json",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "rtsps list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+        crate::assert_schema_matches("protect rtsps list", &body);
+    }
+
+    #[tokio::test]
+    async fn a_stream_the_controller_did_not_return_is_not_reported_as_created() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "{CAMERAS_PATH}/aaaaaaaaaaaaaaaaaaaaaaaa/rtsps-stream"
+            )))
+            // Asked for high and medium; only high comes back.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "high": "rtsps://192.0.2.10:7441/abc"
+            })))
+            .mount(&server)
+            .await;
+
+        let output = run(
+            &server.uri(),
+            &[
+                "protect",
+                "rtsps",
+                "create",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                "--quality",
+                "high,medium",
+                "-o",
+                "json",
+            ],
+        );
+
+        assert!(
+            !output.status.success(),
+            "a request carried out in part must not exit 0: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("medium"),
+            "the quality that was not created must be named: {stderr}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_stream_asked_for_coming_back_is_a_plain_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "{CAMERAS_PATH}/aaaaaaaaaaaaaaaaaaaaaaaa/rtsps-stream"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "high": "rtsps://192.0.2.10:7441/abc",
+                "medium": "rtsps://192.0.2.10:7441/def"
+            })))
+            .mount(&server)
+            .await;
+
+        let output = run(
+            &server.uri(),
+            &[
+                "protect",
+                "rtsps",
+                "create",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                "--quality",
+                "high,medium",
+                "-o",
+                "json",
+            ],
+        );
+
+        assert!(
+            output.status.success(),
+            "nothing was missing: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("stdout was not JSON");
+        assert_eq!(body["status"], "ok", "{body}");
+        assert_eq!(body["not_created"].as_array().map(|a| a.len()), Some(0));
+
+        // The schema's published output_fields must exactly match the keys this
+        // command emits, the same property `ports show` holds itself to. The
+        // fields that say a request was only half carried out are worth nothing
+        // if an agent reading the contract cannot learn they exist.
+        let schema_output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .arg("schema")
+            .output()
+            .expect("failed to run unifi schema");
+        let schema: serde_json::Value = serde_json::from_slice(&schema_output.stdout)
+            .expect("unifi schema must print valid JSON");
+        let create = schema["commands"]
+            .as_array()
+            .expect("schema must have a commands array")
+            .iter()
+            .find(|c| c["name"] == "protect rtsps create")
+            .expect("schema must publish a \"protect rtsps create\" command");
+        let mut declared: Vec<&str> = create["output_fields"]
+            .as_array()
+            .expect("protect rtsps create must declare output_fields")
+            .iter()
+            .map(|f| f["name"].as_str().expect("output field must have a name"))
+            .collect();
+        declared.sort_unstable();
+        let mut emitted: Vec<&str> = body
+            .as_object()
+            .expect("output must be a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        emitted.sort_unstable();
+        assert_eq!(
+            emitted, declared,
+            "protect rtsps create output_fields in the schema must exactly match \
+             the keys it emits"
+        );
+    }
+
+    /// Stand in for the cookie-authenticated direct Protect API that `--full`
+    /// uses: a login that hands back a TOKEN cookie, plus one camera.
+    async fn serving_full(camera: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "TOKEN=stand-in; Path=/")
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{CAMERAS_PATH}/aaaaaaaaaaaaaaaaaaaaaaaa")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door"}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/protect/api/cameras/aaaaaaaaaaaaaaaaaaaaaaaa"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(camera))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn show_full(server_uri: &str) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                server_uri,
+                "--api-key",
+                "test-key",
+                "--username",
+                "stand-in",
+                "--password",
+                "stand-in",
+                "-o",
+                "text",
+                "protect",
+                "cameras",
+                "show",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                "--full",
+            ])
+            .output()
+            .expect("failed to run the unifi binary")
+    }
+
+    #[tokio::test]
+    async fn a_storage_figure_the_camera_did_not_report_is_not_shown_as_zero() {
+        let server = serving_full(serde_json::json!({
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "Front Door",
+            "hqBytesPerDay": 12_000_000_000u64
+        }))
+        .await;
+
+        let output = show_full(&server.uri());
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let storage = stdout
+            .lines()
+            .find(|l| l.contains("Storage:"))
+            .unwrap_or_else(|| panic!("no storage line:\n{stdout}"));
+        assert!(
+            storage.contains("- LQ"),
+            "a figure the camera never sent is unknown, not a claim that the \
+             low-quality stream costs nothing: {storage}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_storage_figures_are_shown_when_the_camera_reports_them() {
+        let server = serving_full(serde_json::json!({
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "Front Door",
+            "hqBytesPerDay": 12_000_000_000u64,
+            "lqBytesPerDay": 1_000_000_000u64
+        }))
+        .await;
+
+        let stdout = String::from_utf8_lossy(&show_full(&server.uri()).stdout).into_owned();
+        let storage = stdout
+            .lines()
+            .find(|l| l.contains("Storage:"))
+            .unwrap_or_else(|| panic!("no storage line:\n{stdout}"));
+        assert!(
+            storage.contains("GB HQ") && storage.contains("MB LQ"),
+            "reported figures must both render: {storage}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_camera_silent_about_recording_does_not_report_that_it_is_not() {
+        let server = serving_full(serde_json::json!({
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "Front Door"
+        }))
+        .await;
+
+        let stdout = String::from_utf8_lossy(&show_full(&server.uri()).stdout).into_owned();
+        let recording = stdout
+            .lines()
+            .find(|l| l.contains("Recording:"))
+            .unwrap_or_else(|| panic!("no recording line:\n{stdout}"));
+        assert!(
+            recording.contains('-') && !recording.contains("no"),
+            "a camera that said nothing about recording has not said it is \
+             idle: {recording}"
+        );
+    }
+
+    fn show_full_json(server_uri: &str) -> serde_json::Value {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args([
+                "--host",
+                server_uri,
+                "--api-key",
+                "test-key",
+                "--username",
+                "stand-in",
+                "--password",
+                "stand-in",
+                "-o",
+                "json",
+                "protect",
+                "cameras",
+                "show",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                "--full",
+            ])
+            .output()
+            .expect("failed to run the unifi binary");
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+            panic!(
+                "stdout was not JSON ({e}): {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+    }
+
+    /// The JSON-only siblings of the flags above. They reach an agent rather
+    /// than a person, where a bare `false` is taken at face value.
+    #[tokio::test]
+    async fn the_flags_only_json_carries_are_null_when_the_camera_omits_them() {
+        let server = serving_full(serde_json::json!({
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "Front Door",
+            "recordingSettings": {"mode": "always"},
+            "channels": [{"id": 0, "name": "High"}]
+        }))
+        .await;
+
+        let body = show_full_json(&server.uri());
+        assert!(
+            body["motion_detected"].is_null(),
+            "a camera that did not report motion has not reported stillness: {body}"
+        );
+        assert!(
+            body["recording_settings"]["motion_detection"].is_null(),
+            "settings that never mentioned motion detection have not said it is \
+             off: {body}"
+        );
+        assert!(
+            body["channels"][0]["enabled"].is_null(),
+            "a channel whose state was not reported is not a disabled channel: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_flags_only_json_carries_survive_when_the_camera_reports_them() {
+        let server = serving_full(serde_json::json!({
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "Front Door",
+            "isMotionDetected": false,
+            "recordingSettings": {"mode": "always", "enableMotionDetection": true},
+            "channels": [{"id": 0, "name": "High", "enabled": false}]
+        }))
+        .await;
+
+        let body = show_full_json(&server.uri());
+        assert_eq!(body["motion_detected"], false, "{body}");
+        assert_eq!(
+            body["recording_settings"]["motion_detection"], true,
+            "{body}"
+        );
+        assert_eq!(body["channels"][0]["enabled"], false, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_camera_page_is_not_requested_when_the_id_is_already_an_id() {
+        // Resolution short-circuits on a 24-char hex ID, so no listing is
+        // served here at all: if the binary asked for one it would fail.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("{CAMERAS_PATH}/aaaaaaaaaaaaaaaaaaaaaaaa")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaa", "name": "Front Door"}),
+            ))
+            .mount(&server)
+            .await;
+
+        let output = run(
+            &server.uri(),
+            &[
+                "protect",
+                "cameras",
+                "show",
+                "aaaaaaaaaaaaaaaaaaaaaaaa",
+                "-o",
+                "json",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "an ID must resolve without a listing: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+// A schema that does not describe the output is worse than no schema: it sends
+// an agent looking for a key that never arrives, or hides one that does. Both
+// halves were live defects, found by comparing declared fields against a real
+// controller's output by hand. These guards do that comparison in CI instead.
+mod schema_contract {
+    use super::*;
+
+    const SYSINFO: &str = "/proxy/network/api/s/default/stat/sysinfo";
+
+    async fn mount_sysinfo(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(SYSINFO))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "hostname": "UCG-Ultra", "version": "10.1.85",
+                    "timezone": "Europe/Amsterdam", "uptime": 1737960
+                }]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Serve `stat/sysinfo`, and answer `/api/system` with `host_system` when
+    /// given. Leaving it out models a host system that could not be reached,
+    /// which wiremock answers with a 404.
+    async fn serving_system(host_system: Option<serde_json::Value>) -> MockServer {
+        let server = MockServer::start().await;
+        mount_sysinfo(&server).await;
+        if let Some(body) = host_system {
+            Mock::given(method("GET"))
+                .and(path("/api/system"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    #[tokio::test]
+    async fn system_info_json_matches_schema_output_fields() {
+        let server = serving_system(Some(serde_json::json!({"deviceState": "online"}))).await;
+        let body = run_json(&server, &["system", "info"]).await;
+        assert_schema_matches("system info", &body);
+    }
+
+    #[tokio::test]
+    async fn a_state_the_host_did_not_report_is_unknown_not_up_to_date() {
+        let server = serving_system(Some(serde_json::json!({"name": "UCG Ultra"}))).await;
+        let body = run_json(&server, &["system", "info"]).await;
+        assert_eq!(
+            body["update_available"],
+            serde_json::Value::Null,
+            "a host that reported no device state has not reported an up-to-date one: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_system_that_could_not_be_reached_leaves_the_update_state_unknown() {
+        let server = serving_system(None).await;
+        let body = run_json(&server, &["system", "info"]).await;
+        assert_eq!(
+            body["update_available"],
+            serde_json::Value::Null,
+            "a check that could not be made is not a check that came back clean: {body}"
+        );
+    }
+
+    // Positive control for the two above: a state the host did report must
+    // still settle the question, in both directions. A fix that hid unknowns
+    // by never answering would pass those tests and fail these.
+    #[tokio::test]
+    async fn a_reported_state_still_settles_the_question() {
+        let up_to_date = serving_system(Some(serde_json::json!({"deviceState": "online"}))).await;
+        let body = run_json(&up_to_date, &["system", "info"]).await;
+        assert_eq!(body["update_available"], serde_json::json!(false));
+
+        let waiting =
+            serving_system(Some(serde_json::json!({"deviceState": "updateAvailable"}))).await;
+        let body = run_json(&waiting, &["system", "info"]).await;
+        assert_eq!(body["update_available"], serde_json::json!(true));
+    }
+
+    // The human surface has the same requirement: silence has always meant "up
+    // to date", so an unknown state cannot also be silent.
+    #[tokio::test]
+    async fn text_output_says_unknown_rather_than_staying_silent() {
+        let unknown = serving_system(Some(serde_json::json!({"name": "UCG Ultra"}))).await;
+        let text = run_text(&unknown, &["system", "info"]);
+        assert!(
+            text.contains("Unknown"),
+            "an unreported update state must be shown, not omitted: {text}"
+        );
+
+        let up_to_date = serving_system(Some(serde_json::json!({"deviceState": "online"}))).await;
+        let text = run_text(&up_to_date, &["system", "info"]);
+        assert!(
+            !text.contains("Update:"),
+            "a host that reported being up to date still needs no line: {text}"
+        );
+    }
+
+    fn run_text(server: &MockServer, args: &[&str]) -> String {
+        let uri = server.uri();
+        let mut argv = vec!["--host", uri.as_str(), "--api-key", "test-key"];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["--output", "text"]);
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_unifi"))
+            .args(&argv)
+            .output()
+            .expect("failed to run the unifi binary");
+        assert!(
+            output.status.success(),
+            "{} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    async fn serving_one_device() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": [{
+                    "mac": "aa:bb:cc:dd:06:43", "name": "Switch Lite 8 PoE",
+                    "model": "USL8LP", "ip": "192.0.2.10", "state": 1,
+                    "version": "7.1.20.16850", "uptime": 401234, "num_sta": 6
+                }]
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn devices_show_json_matches_schema_output_fields() {
+        let server = serving_one_device().await;
+        let body = run_json(&server, &["devices", "show", "aa:bb:cc:dd:06:43"]).await;
+        assert_schema_matches("devices show", &body);
+    }
+
+    // `firmware` is the name `devices list` publishes for this value, so an
+    // agent that reads it there and asks this command for the same device must
+    // find it under the same name.
+    #[tokio::test]
+    async fn devices_show_emits_the_firmware_it_declares() {
+        let server = serving_one_device().await;
+        let body = run_json(&server, &["devices", "show", "aa:bb:cc:dd:06:43"]).await;
+        assert_eq!(body["firmware"], serde_json::json!("7.1.20.16850"));
+        assert_eq!(
+            body["firmware"], body["version"],
+            "firmware and version are the same value under two names: {body}"
+        );
+    }
+
+    // --- The rest of the read-only surface ---
+    //
+    // Two drifts were found by comparing declared fields against a real
+    // controller by hand. Every remaining command that publishes output_fields
+    // gets the same comparison here, so the next one cannot reach a release.
+
+    async fn mount_legacy(server: &MockServer, endpoint: &str, data: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("/proxy/network/api/s/default/{endpoint}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"},
+                "data": data
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn serving_legacy(endpoint: &str, data: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        mount_legacy(&server, endpoint, data).await;
+        server
+    }
+
+    async fn serving_integration(resource: &str, data: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        mount_site_discovery(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                r"/proxy/network/integration/v1/sites/.*/{resource}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "offset": 0, "limit": 200, "count": 1, "totalCount": 1,
+                "data": data
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn one_station() -> serde_json::Value {
+        serde_json::json!([{
+            "_id": "1", "mac": "aa:bb:cc:dd:ee:ff", "name": "Workstation", "ip": "192.0.2.20",
+            "is_wired": true, "uptime": 8000, "tx_bytes": 4096, "rx_bytes": 8192,
+            "signal": -55, "essid": "HomeWiFi", "ap_mac": "aa:bb:cc:dd:06:43",
+            "network": "LAN", "vlan": 10, "blocked": false
+        }])
+    }
+
+    fn one_switch_with_a_port() -> serde_json::Value {
+        serde_json::json!([{
+            "mac": "aa:bb:cc:dd:06:43", "name": "Switch Lite 8 PoE",
+            "port_table": [{
+                "port_idx": 1, "name": "office", "media": "GE", "up": true,
+                "speed": 1000, "full_duplex": true, "port_poe": true,
+                "poe_enable": true, "poe_power": 3.1,
+                "tx_bytes": 100, "rx_bytes": 200,
+                "last_connection": {"mac": "aabbccddeeff", "connected": true}
+            }]
+        }])
+    }
+
+    #[tokio::test]
+    async fn clients_list_json_matches_schema_output_fields() {
+        let server = serving_integration(
+            "clients",
+            serde_json::json!([{
+                "macAddress": "aa:bb:cc:dd:ee:ff", "ipAddress": "192.0.2.20",
+                "name": "Workstation", "type": "WIRED"
+            }]),
+        )
+        .await;
+        // The listing draws on both APIs: the Integration one for the roster,
+        // the legacy one for the signal and traffic columns.
+        mount_legacy(&server, "stat/sta", one_station()).await;
+        let body = run_json(&server, &["clients", "list"]).await;
+        assert_schema_matches("clients list", &body);
+    }
+
+    #[tokio::test]
+    async fn clients_show_json_matches_schema_output_fields() {
+        let server = serving_legacy("stat/sta", one_station()).await;
+        let body = run_json(&server, &["clients", "show", "aa:bb:cc:dd:ee:ff"]).await;
+        assert_schema_matches("clients show", &body);
+    }
+
+    #[tokio::test]
+    async fn clients_top_json_matches_schema_output_fields() {
+        let server = serving_legacy("stat/sta", one_station()).await;
+        let body = run_json(&server, &["clients", "top"]).await;
+        assert_schema_matches("clients top", &body);
+    }
+
+    #[tokio::test]
+    async fn devices_list_json_matches_schema_output_fields() {
+        let server = serving_integration(
+            "devices",
+            serde_json::json!([{
+                "macAddress": "aa:bb:cc:dd:06:43", "ipAddress": "192.0.2.10",
+                "name": "Switch Lite 8 PoE", "model": "USL8LP",
+                "state": "ONLINE", "firmwareVersion": "7.1.20.16850"
+            }]),
+        )
+        .await;
+        let body = run_json(&server, &["devices", "list"]).await;
+        assert_schema_matches("devices list", &body);
+    }
+
+    #[tokio::test]
+    async fn networks_list_json_matches_schema_output_fields() {
+        let server = serving_integration(
+            "networks",
+            serde_json::json!([{"name": "LAN", "vlanId": 10, "enabled": true, "default": true}]),
+        )
+        .await;
+        let body = run_json(&server, &["networks", "list"]).await;
+        assert_schema_matches("networks list", &body);
+    }
+
+    #[tokio::test]
+    async fn networks_show_json_matches_schema_and_omits_unknown_fields() {
+        let server = serving_legacy(
+            "rest/networkconf",
+            serde_json::json!([{
+                "_id": "net-1", "name": "LAN", "purpose": "corporate",
+                "vlan": 10, "ip_subnet": "192.0.2.1/24", "enabled": true,
+                "dhcpd_enabled": true, "dhcpd_dns_enabled": true,
+                "dhcpd_dns_1": "192.0.2.53", "dhcpd_dns_2": "192.0.2.54",
+                "mdns_enabled": true, "lte_lan_enabled": false,
+                "x_private_key": "must-not-appear",
+                "x_api_token": "must-not-appear-either"
+            }]),
+        )
+        .await;
+        let body = run_json(&server, &["networks", "show", "lan"]).await;
+        assert_schema_matches("networks show", &body);
+        let encoded = body.to_string();
+        assert!(!encoded.contains("must-not-appear"));
+        assert_eq!(
+            body["dns_servers"],
+            serde_json::json!(["192.0.2.53", "192.0.2.54"])
+        );
+    }
+
+    #[tokio::test]
+    async fn devices_ports_json_matches_schema_output_fields() {
+        let server = serving_legacy("stat/device", one_switch_with_a_port()).await;
+        let body = run_json(&server, &["devices", "ports", "aa:bb:cc:dd:06:43"]).await;
+        assert_schema_matches("devices ports", &body);
+    }
+
+    #[tokio::test]
+    async fn ports_list_json_matches_schema_output_fields() {
+        let server = serving_legacy("stat/device", one_switch_with_a_port()).await;
+        let body = run_json(&server, &["ports", "list", "aa:bb:cc:dd:06:43"]).await;
+        assert_schema_matches("ports list", &body);
+    }
+
+    #[tokio::test]
+    async fn ports_find_json_matches_schema_output_fields() {
+        let server = serving_legacy("stat/device", one_switch_with_a_port()).await;
+        // `find` resolves a client to the port it is attached to, so it needs
+        // the client roster as well as the port tables.
+        mount_legacy(&server, "stat/sta", one_station()).await;
+        let body = run_json(&server, &["ports", "find", "Workstation"]).await;
+        assert_schema_matches("ports find", &body);
+    }
+
+    #[tokio::test]
+    async fn events_list_json_matches_schema_output_fields() {
+        let server = serving_legacy(
+            "stat/event",
+            serde_json::json!([{
+                "key": "EVT_WU_Connected", "msg": "User connected",
+                "subsystem": "wlan", "time": 1700000000,
+                "datetime": "2024-01-15T10:30:00Z"
+            }]),
+        )
+        .await;
+        let body = run_json(&server, &["events", "list"]).await;
+        assert_schema_matches("events list", &body);
+    }
+
+    #[tokio::test]
+    async fn system_health_json_matches_schema_output_fields() {
+        let server = serving_legacy(
+            "stat/health",
+            serde_json::json!([{
+                "subsystem": "wan", "status": "ok", "num_sta": 12, "num_ap": 3,
+                "num_sw": 2, "wan_ip": "203.0.113.4", "isp_name": "Example ISP"
+            }]),
+        )
+        .await;
+        let body = run_json(&server, &["system", "health"]).await;
+        assert_schema_matches("system health", &body);
+    }
+
+    #[tokio::test]
+    async fn port_forward_output_matches_schema_and_omits_unknown_fields() {
+        let server = serving_legacy(
+            "rest/portforward",
+            serde_json::json!([{
+                "_id": "forward-1", "name": "Plex", "enabled": true,
+                "proto": "tcp", "src": "any", "dst_port": "32400",
+                "fwd": "192.0.2.10", "fwd_port": "32400", "pfwd_interface": "wan",
+                "log": false, "x_api_token": "must-not-escape"
+            }]),
+        )
+        .await;
+        let list = run_json(&server, &["port-forwards", "list"]).await;
+        let show = run_json(&server, &["port-forwards", "show", "plex"]).await;
+        assert_schema_matches("port-forwards list", &list);
+        assert_schema_matches("port-forwards show", &show);
+        let rendered = format!("{list}{show}");
+        assert!(!rendered.contains("must-not-escape"));
+    }
+
+    // The order carries the meaning here: a forward reads as source, then the
+    // port it selects, then where that port goes. Sorting the fields by name
+    // instead puts the destination ahead of the source it applies to, and
+    // renders a port the controller never set as a literal `null`.
+    #[tokio::test]
+    async fn port_forwards_show_prints_audit_order_and_dashes_absent_values() {
+        let server = serving_legacy(
+            "rest/portforward",
+            serde_json::json!([{
+                "_id": "forward-1", "name": "Plex", "enabled": true,
+                "proto": "tcp", "src": "any", "dst_port": "32400",
+                "fwd": "192.0.2.10", "fwd_port": "32400",
+                "pfwd_interface": "wan", "log": false
+            }]),
+        )
+        .await;
+        let text = run_text(&server, &["port-forwards", "show", "plex"]);
+
+        assert!(
+            !text.contains("null"),
+            "a value the controller never set renders as a dash, not null: {text}"
+        );
+        let source_port = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("Source port"))
+            .unwrap_or_else(|| panic!("no source port line in: {text}"));
+        assert!(
+            source_port.trim_end().ends_with('-'),
+            "an unset source port renders as a dash: {source_port}"
+        );
+
+        let at = |label: &str| {
+            text.find(label)
+                .unwrap_or_else(|| panic!("no {label} line in: {text}"))
+        };
+        assert!(
+            at("Source") < at("External port"),
+            "the source prints before the port it selects: {text}"
+        );
+        assert!(
+            at("External port") < at("Destination"),
+            "the external port prints before the destination it forwards to: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wan_output_matches_schema_and_omits_unknown_fields() {
+        let server = serving_legacy(
+            "stat/device",
+            serde_json::json!([{
+                "type": "udm",
+                "wan1": {"name": "Primary", "ifname": "eth9", "enable": true, "up": true,
+                    "ip": "192.0.2.1", "availability": 100, "latency": 12,
+                    "x_api_token": "must-not-escape"},
+                "wan3": {"name": "Backup", "ifname": "gre1", "up": true,
+                    "mbb_state": "ready", "mbb": {"signal_pct": 75, "rat": "LTE"}}
+            }]),
+        )
+        .await;
+        let body = run_json(&server, &["wan", "list"]).await;
+        assert_schema_matches("wan list", &body);
+        assert!(!body.to_string().contains("must-not-escape"));
+    }
+
+    // UniFi writes `-1` into these gauges when it has nothing to measure, which
+    // a down link produces routinely. Published as readings they are
+    // indistinguishable from real ones, and a caller ranking uplinks by latency
+    // would put the dead link first. Counters are the sharper case: declared as
+    // unsigned, one such marker aborts the whole WAN block, so an unknown byte
+    // count becomes a command that reports no interfaces at all.
+    #[tokio::test]
+    async fn wan_reports_an_unmeasured_gauge_as_absent_not_as_a_reading() {
+        let server = serving_legacy(
+            "stat/device",
+            serde_json::json!([{
+                "type": "udm",
+                "wan1": {"name": "Primary", "ifname": "eth9", "enable": true, "up": false,
+                    "availability": -1, "latency": -1, "speed": -1,
+                    "rx_bytes": -1, "tx_bytes": 4096},
+                "wan3": {"name": "Backup", "ifname": "gre1", "up": true, "mbb_state": "ready",
+                    "mbb": {"signal_pct": -1, "rat": "LTE", "lte_rsrp": -95.0, "lte_sinr": -2.5}}
+            }]),
+        )
+        .await;
+        let body = run_json(&server, &["wan", "list"]).await;
+        assert_eq!(
+            body.as_array().map(Vec::len),
+            Some(2),
+            "an unmeasured counter costs its own field, not the whole block: {body}"
+        );
+
+        let down = &body[0];
+        for gauge in ["availability", "latency_ms", "speed_mbps", "rx_bytes"] {
+            assert!(
+                down[gauge].is_null(),
+                "an unmeasured {gauge} is absent, not a reading: {down}"
+            );
+        }
+        assert_eq!(
+            down["tx_bytes"],
+            serde_json::json!(4096),
+            "a counter the gateway did measure survives beside one it did not: {down}"
+        );
+
+        let cellular = &body[1];
+        assert!(
+            cellular["signal_percent"].is_null(),
+            "an unmeasured signal percentage is absent, not zero signal: {cellular}"
+        );
+        assert_eq!(
+            cellular["lte_rsrp"],
+            serde_json::json!(-95.0),
+            "reference signal power is negative across its range and is a real reading: {cellular}"
+        );
+        assert_eq!(
+            cellular["lte_sinr"],
+            serde_json::json!(-2.5),
+            "a signal to noise ratio below the noise floor is a real reading: {cellular}"
+        );
     }
 }

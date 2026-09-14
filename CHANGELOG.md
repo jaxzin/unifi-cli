@@ -2,9 +2,90 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2](https://github.com/rvben/unifi-cli/compare/v0.4.1...v0.4.2) - 2026-08-26
 
+### Added
 
+- **tui**: make controller setup recoverable ([6017bbd](https://github.com/rvben/unifi-cli/commit/6017bbdc591fd512de5eb6c804267961f95e7bf6))
 
+## [0.4.1](https://github.com/rvben/unifi-cli/compare/v0.4.0...v0.4.1) - 2026-08-26
+
+### Fixed
+
+- **release**: use package version in dry runs ([347b90a](https://github.com/rvben/unifi-cli/commit/347b90a43db9411c0d52cb474adf7256d99678b0))
+- **ci**: install pinned Rust components ([37b0182](https://github.com/rvben/unifi-cli/commit/37b01828f630fa2ed4ef141a31199023107d209a))
+
+### Performance
+
+- **packaging**: make package launcher lightweight ([a3d7c97](https://github.com/rvben/unifi-cli/commit/a3d7c97ee1cab8637842bae9fc6b75408fa4ec7c))
+
+## [0.4.0](https://github.com/rvben/unifi-cli/compare/v0.3.5...v0.4.0) - 2026-08-18
+
+### Added
+
+- add WAN status inventory ([c4f908e](https://github.com/rvben/unifi-cli/commit/c4f908ea5b474b0ef26ca16dd6edc5f4b644edf1))
+- add port forward inventory ([9d9b835](https://github.com/rvben/unifi-cli/commit/9d9b835edf33ce70c3c94babc62e25c59b6cc5ce))
+- add network detail inspection ([8047cbb](https://github.com/rvben/unifi-cli/commit/8047cbb03fb2104f5c2f0bcbc3d247a11902909a))
+
+### Fixed
+
+- **release**: scope assets to the current tag ([732b4fa](https://github.com/rvben/unifi-cli/commit/732b4faa345750515c8d52396ffe3c4e7d7d046f))
+
+## [0.3.4](https://github.com/rvben/unifi-cli/compare/v0.3.3...v0.3.4) - 2026-08-11
+
+### Breaking Changes
+
+- **protect**: wrap the camera list in the standard items envelope ([e7b77bf](https://github.com/rvben/unifi-cli/commit/e7b77bf06dc64def4de1312bd3a5d6a207e60262))
+
+### Added
+
+- **protect**: wrap the camera list in the standard items envelope ([e7b77bf](https://github.com/rvben/unifi-cli/commit/e7b77bf06dc64def4de1312bd3a5d6a207e60262))
+
+### Fixed
+
+- **devices**: emit the firmware field devices show declares ([0f007c1](https://github.com/rvben/unifi-cli/commit/0f007c186a285b7250d5a539cebc1b561ba2be80))
+- **system**: report an unchecked update state as unknown, not up to date ([38492bb](https://github.com/rvben/unifi-cli/commit/38492bb6ff45f62e234bcc7409180b683f9a64c0))
+- **protect**: make the remaining reported-flag defaults tri-state ([4decf08](https://github.com/rvben/unifi-cli/commit/4decf08b38a7ed1ef31cfa792d492f3bfc5df76e))
+- **clients**: rank and print unknown traffic as unknown, not zero ([cbe0b66](https://github.com/rvben/unifi-cli/commit/cbe0b663fd9529c918c40a91f27e1b504e674984))
+- **schema**: publish the fields that say an rtsps create was partial ([9eb083e](https://github.com/rvben/unifi-cli/commit/9eb083e2031e192fceec6bbb1aa09c2fac5a3055))
+- **protect**: stop turning absent camera data into confident values ([29cf091](https://github.com/rvben/unifi-cli/commit/29cf091955b5452814957961b066ff4ddc41a8e0))
+- **tui**: let a throughput measurement expire instead of standing forever ([d7ca1f8](https://github.com/rvben/unifi-cli/commit/d7ca1f8499461990d6390427cdffa071716ecec8))
+- **tui**: stop reporting throughput for a port whose link has gone down ([00a18d8](https://github.com/rvben/unifi-cli/commit/00a18d811e969697b78e7260e5515715c336df3e))
+- **tui**: measure port throughput over the window the counters actually changed ([b2ae602](https://github.com/rvben/unifi-cli/commit/b2ae60228f1d8be44a2ae158a4b8a840d371d8fd))
+- **cli**: exit quietly when the output pipe closes early ([518fd96](https://github.com/rvben/unifi-cli/commit/518fd963f9c6eaf21b994ec6439ffa16cb6097a9))
+- **tui**: aim overlay actions at the entity the panel was opened on ([43fdd32](https://github.com/rvben/unifi-cli/commit/43fdd32abfa71fe1a1e7810e87af9c1033deb224))
+- **events**: report an absent event surface as unsupported, not a rejected request ([b3be651](https://github.com/rvben/unifi-cli/commit/b3be65186c65dd0d5849c47f388da63d5eb3a347))
+
+## [0.3.3](https://github.com/rvben/unifi-cli/compare/v0.3.2...v0.3.3) - 2026-08-10
+
+### Fixed
+
+- **api**: decode a response body before judging its content type ([0e49404](https://github.com/rvben/unifi-cli/commit/0e4940467e428f4cea20f54c1eafbc337b6cca00))
+- **api**: report an absent controller application as unsupported ([0f5384c](https://github.com/rvben/unifi-cli/commit/0f5384c84caccc3dfcbf5b5b63831cd97eca55b5))
+
+## [0.3.2](https://github.com/rvben/unifi-cli/compare/v0.3.1...v0.3.2) - 2026-08-10
+
+### Fixed
+
+- **config**: write the config atomically on Windows too ([0c2977e](https://github.com/rvben/unifi-cli/commit/0c2977e238ccb09ca2949560568c4f8b8fd528db))
+- **config**: replace the config file atomically instead of writing in place ([9ba19fb](https://github.com/rvben/unifi-cli/commit/9ba19fbde8b498488f43b1af1ab1d2771189d672))
+- **output**: keep 408 and 429 retryable instead of permanent client errors ([1068bae](https://github.com/rvben/unifi-cli/commit/1068baed75ce232028fec0277c1ca38324723a35))
+- **ports**: keep the attachment flag tri-state instead of reading absence as gone ([de2e770](https://github.com/rvben/unifi-cli/commit/de2e770d30cbc3cba64cf5b06640549a9655c776))
+- **config**: create the credentials file with owner-only permissions ([8b7789d](https://github.com/rvben/unifi-cli/commit/8b7789d2d87edc5819e950573130000370c6939f))
+- **schema**: publish an error and confirmation contract that matches runtime ([5176ccf](https://github.com/rvben/unifi-cli/commit/5176ccfefeb08df4fecd0d7a6d83882f5e06c57f))
+- **ports**: report a stale last connection as unattached ([e80cda5](https://github.com/rvben/unifi-cli/commit/e80cda542fce27db385fc43bd69093c265ead464))
+
+## [0.3.1](https://github.com/rvben/unifi-cli/compare/v0.3.0...v0.3.1) - 2026-08-10
+
+### Added
+
+- **ports**: add ports command tree with single-port PoE power-cycling ([b14794e](https://github.com/rvben/unifi-cli/commit/b14794e976638f7c4a5a21639ebe8a8b011ab25c))
+
+### Fixed
+
+- **cli**: prompt before every destructive command, not just ports cycle ([ae49798](https://github.com/rvben/unifi-cli/commit/ae4979886d63b4dd982a3a38de34a0ff343d5f18))
+- **schema**: publish flags as boolean and port/watch as integer ([7c21144](https://github.com/rvben/unifi-cli/commit/7c21144d93afa68cb021a9191c769dea4af496ba))
+- **ports**: give the PoE class label its colon and align the detail column ([1cd56d0](https://github.com/rvben/unifi-cli/commit/1cd56d03c3e0ec12a025030a051c135a1fa0865c))
 
 ## [0.3.0](https://github.com/rvben/unifi-cli/compare/v0.2.3...v0.3.0) - 2026-07-09
 
@@ -110,7 +191,7 @@ Thanks to [@l3wi](https://github.com/l3wi) for reporting the TLS certificate val
 - TUI: device panel shows all devices without scrolling, cursor moves through items
 - TUI: client list viewport follows cursor instead of cursor staying at top
 - CLI: dynamic column widths adapt to data instead of fixed widths causing misalignment
-- CLI: MAC suffixes stripped from display names (e.g., "garage-bluetooth-proxy" instead of "garage-bluetooth-proxy 43:3c")
+- CLI: MAC suffixes stripped from display names (e.g., "lobby-bluetooth-proxy" instead of "lobby-bluetooth-proxy 43:3c")
 
 ### Changed
 - TUI: overlay shortcut hints moved from footer to overlay bottom border

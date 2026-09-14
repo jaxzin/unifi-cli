@@ -26,6 +26,111 @@ pub struct LegacyMeta {
     pub msg: Option<String>,
 }
 
+/// A port-forward record from the legacy Network API. This intentionally
+/// allowlists only fields useful for policy audits.
+#[derive(Debug, Deserialize)]
+pub struct PortForward {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    pub proto: Option<String>,
+    pub src: Option<String>,
+    pub src_port: Option<String>,
+    pub dst_port: Option<String>,
+    pub fwd: Option<String>,
+    pub fwd_port: Option<String>,
+    pub pfwd_interface: Option<String>,
+    #[serde(default)]
+    pub log: bool,
+}
+
+/// A gauge UniFi reports as `-1` when it has no measurement to report.
+///
+/// Decoding that as a reading makes an unmeasured link indistinguishable from
+/// a healthy one, so it decodes as absent instead. This is only applied to
+/// quantities for which no negative value is a measurement: a latency, a
+/// percentage, a counter or a rate. Radio metrics are negative by nature and
+/// are decoded as they arrive.
+fn unmeasured_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(deserializer)?.filter(|value| *value >= 0.0))
+}
+
+/// The counter form of `unmeasured_f64`.
+///
+/// Decoding through `i64` keeps a negative marker local to the field that
+/// carries it. Declaring these `u64` instead lets one such value abort the
+/// whole WAN block, which turns a single unknown counter into a command that
+/// reports nothing at all.
+fn unmeasured_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?
+        .filter(|value| *value >= 0)
+        .map(|value| value as u64))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GatewayWanStatus {
+    #[serde(rename = "type")]
+    pub device_type: Option<String>,
+    pub wan1: Option<WanInterface>,
+    pub wan2: Option<WanInterface>,
+    pub wan3: Option<WanInterface>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WanInterface {
+    pub name: Option<String>,
+    pub ifname: Option<String>,
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default)]
+    pub up: bool,
+    pub ip: Option<String>,
+    #[serde(default, deserialize_with = "unmeasured_f64")]
+    pub availability: Option<f64>,
+    #[serde(default, deserialize_with = "unmeasured_f64")]
+    pub latency: Option<f64>,
+    #[serde(default, deserialize_with = "unmeasured_u64")]
+    pub speed: Option<u64>,
+    #[serde(default, deserialize_with = "unmeasured_u64")]
+    pub rx_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "unmeasured_u64")]
+    pub tx_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "unmeasured_u64")]
+    pub rx_rate: Option<u64>,
+    #[serde(default, deserialize_with = "unmeasured_u64")]
+    pub tx_rate: Option<u64>,
+    pub mbb: Option<CellularStatus>,
+    pub mbb_state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CellularStatus {
+    #[serde(default, deserialize_with = "unmeasured_f64")]
+    pub signal_pct: Option<f64>,
+    pub rat: Option<String>,
+    /// Reference signal power in dBm, negative across its whole range.
+    pub lte_rsrp: Option<f64>,
+    /// Reference signal quality in dB, negative across its whole range.
+    pub lte_rsrq: Option<f64>,
+    /// Signal to noise ratio in dB, negative on a link that is worse than its
+    /// own noise floor.
+    pub lte_sinr: Option<f64>,
+}
+
+#[derive(Debug)]
+pub struct NamedWanInterface {
+    pub slot: &'static str,
+    pub interface: WanInterface,
+}
+
 // Site
 #[derive(Debug, Deserialize)]
 pub struct Site {
@@ -165,6 +270,31 @@ pub struct Network {
     pub default: bool,
 }
 
+/// Network configuration from the legacy `rest/networkconf` endpoint.
+///
+/// Keep this deliberately typed: network configuration records can grow new,
+/// sensitive fields over time and commands must never serialize the raw object.
+#[derive(Debug, Deserialize)]
+pub struct LegacyNetwork {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub name: Option<String>,
+    pub purpose: Option<String>,
+    pub vlan: Option<u16>,
+    pub ip_subnet: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub dhcpd_enabled: bool,
+    #[serde(default)]
+    pub dhcpd_dns_enabled: bool,
+    pub dhcpd_dns_1: Option<String>,
+    pub dhcpd_dns_2: Option<String>,
+    #[serde(default)]
+    pub mdns_enabled: bool,
+    pub lte_lan_enabled: Option<bool>,
+}
+
 // Health subsystem from Legacy stat/health
 #[derive(Debug, Deserialize)]
 pub struct HealthSubsystem {
@@ -196,8 +326,15 @@ pub struct HostSystem {
 }
 
 impl HostSystem {
-    pub fn update_available(&self) -> bool {
-        self.device_state.as_deref() == Some("updateAvailable")
+    /// Whether a firmware update is waiting, or `None` when the host did not say.
+    ///
+    /// A host that reported no device state has not reported an up-to-date one,
+    /// so the answer is unknown rather than negative. Only a state the host did
+    /// report settles the question, either way.
+    pub fn update_available(&self) -> Option<bool> {
+        self.device_state
+            .as_deref()
+            .map(|state| state == "updateAvailable")
     }
 }
 
@@ -302,8 +439,41 @@ pub struct PortEntry {
     pub poe_power: Option<f64>,
     #[serde(default)]
     pub port_poe: bool,
+    /// "auto", "off", "passthrough", "passive24v". Absent on some firmware.
+    pub poe_mode: Option<String>,
+    pub poe_class: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_number_f64")]
+    pub poe_voltage: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_string_or_number_f64")]
+    pub poe_current: Option<f64>,
+    pub poe_good: Option<bool>,
+    /// Auto-negotiation state. `Option`, not a defaulted bool, like `enable`
+    /// and `is_uplink` below: a firmware that omits this key must not be
+    /// reported as "auto-negotiation off". Matches `poe_good` above; contrast
+    /// `up`/`poe_enable`, where an absent key genuinely does mean false.
+    pub autoneg: Option<bool>,
+    /// Administrative enable state. Same tri-state rationale as `autoneg`: an
+    /// absent key must not be reported as "port administratively disabled".
+    pub enable: Option<bool>,
+    /// Whether this port is the switch's uplink. Same tri-state rationale as
+    /// `autoneg`: an absent key must not be reported as "not an uplink".
+    pub is_uplink: Option<bool>,
+    pub stp_state: Option<String>,
+    pub tx_errors: Option<u64>,
+    pub rx_errors: Option<u64>,
+    /// Absent entirely on a port nothing has linked to within retention.
+    pub last_connection: Option<LastConnection>,
     pub tx_bytes: Option<u64>,
     pub rx_bytes: Option<u64>,
+}
+
+/// The device most recently seen on a port. `connected` distinguishes a live
+/// attachment from a stale record of a device that has since moved.
+#[derive(Debug, Deserialize)]
+pub struct LastConnection {
+    pub mac: Option<String>,
+    pub connected: Option<bool>,
+    pub last_seen: Option<u64>,
 }
 
 fn deserialize_string_or_number_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -333,11 +503,18 @@ where
 // Device with port_table from Legacy stat/device endpoint
 #[derive(Debug, Deserialize)]
 pub struct DeviceWithPorts {
+    /// Controller object id, the target of `PUT /rest/device/<_id>`.
+    #[serde(rename = "_id")]
+    pub id: Option<String>,
     pub mac: Option<String>,
     pub name: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
     pub port_table: Vec<PortEntry>,
+    /// Per-port configuration overrides, kept as raw JSON so a write-back
+    /// preserves every key this CLI does not model.
+    #[serde(default)]
+    pub port_overrides: Vec<serde_json::Value>,
 }
 
 // --- Protect API types ---
@@ -351,8 +528,7 @@ pub struct ProtectCamera {
     pub mac: Option<String>,
     pub state: Option<String>,
     pub model_key: Option<String>,
-    #[serde(default)]
-    pub is_mic_enabled: bool,
+    pub is_mic_enabled: Option<bool>,
     pub video_mode: Option<String>,
     pub feature_flags: Option<ProtectFeatureFlags>,
 }
@@ -392,19 +568,17 @@ pub struct ProtectCameraFull {
     pub uptime: Option<u64>,
     pub up_since: Option<u64>,
     pub last_seen: Option<u64>,
-    #[serde(default)]
-    pub is_recording: bool,
-    #[serde(default)]
-    pub is_motion_detected: bool,
-    #[serde(default)]
-    pub is_dark: bool,
+    pub is_recording: Option<bool>,
+    /// Tri-state for the same reason as `is_recording`: a camera that did not
+    /// report motion has not reported stillness.
+    pub is_motion_detected: Option<bool>,
+    pub is_dark: Option<bool>,
     pub video_codec: Option<String>,
     pub current_resolution: Option<String>,
     pub video_mode: Option<String>,
     pub hdr_type: Option<String>,
     pub phy_rate: Option<f64>,
-    #[serde(default)]
-    pub is_mic_enabled: bool,
+    pub is_mic_enabled: Option<bool>,
     #[serde(default)]
     pub is_poor_network: bool,
     pub last_motion: Option<u64>,
@@ -424,14 +598,14 @@ pub struct ProtectCameraFull {
 pub struct CameraChannel {
     pub id: u32,
     pub name: Option<String>,
-    #[serde(default)]
-    pub enabled: bool,
+    /// Tri-state like `is_rtsp_enabled` below: a channel whose state the camera
+    /// did not report is not a channel reported as switched off.
+    pub enabled: Option<bool>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub fps: Option<u32>,
     pub bitrate: Option<u64>,
-    #[serde(default)]
-    pub is_rtsp_enabled: bool,
+    pub is_rtsp_enabled: Option<bool>,
     pub rtsp_alias: Option<String>,
 }
 
@@ -474,8 +648,9 @@ pub struct WifiConnectionState {
 #[serde(rename_all = "camelCase")]
 pub struct RecordingSettings {
     pub mode: Option<String>,
-    #[serde(default)]
-    pub enable_motion_detection: bool,
+    /// Tri-state: settings that did not mention motion detection have not said
+    /// it is switched off.
+    pub enable_motion_detection: Option<bool>,
 }
 
 /// RTSPS stream URLs keyed by quality level
@@ -485,10 +660,43 @@ pub type RtspsStreams = std::collections::HashMap<String, Option<String>>;
 #[derive(Debug)]
 pub enum ApiError {
     Http(reqwest::Error),
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+    },
     NotFound(String),
     Auth(String),
+    /// A request that cannot succeed against the resource's current state,
+    /// rejected locally before any HTTP call. Published by `unifi schema`
+    /// as kind `conflict`, exit code 6.
+    Conflict(String),
+    /// The controller does not serve this endpoint at all. Distinct from
+    /// `NotFound` because the whole API is absent, not one record, so there is
+    /// no other identifier worth trying. Published as kind `unsupported`.
+    Unsupported {
+        endpoint: String,
+        reason: UnsupportedReason,
+    },
     Other(String),
+}
+
+/// How the controller revealed that an endpoint is absent.
+///
+/// Both forms mean the same thing to a caller, so they share one error kind.
+/// They are kept apart because the message has to say what actually happened:
+/// guessing at the wrong one sends the reader looking for a fault that is not
+/// there.
+#[derive(Debug)]
+pub enum UnsupportedReason {
+    /// The endpoint answered with something other than JSON. UniFi OS proxies
+    /// a request for an application it does not have to its own web UI, so the
+    /// call returns 200 with an HTML page.
+    NotJson { content_type: String },
+    /// The controller rejected the endpoint itself rather than the request.
+    /// UniFi Network answers an unknown legacy resource this way, so a
+    /// firmware that has dropped an endpoint is indistinguishable from one
+    /// that never had it, and neither is worth retrying.
+    Removed,
 }
 
 /// Scan a single error string for TLS certificate failure markers. rustls
@@ -567,8 +775,38 @@ impl fmt::Display for ApiError {
                 write!(f, "Authentication error: {msg}")?;
                 write!(
                     f,
-                    "\n  Hint: Check your API key. Generate one in UniFi Settings > API"
+                    "\n  Hint: Create or replace the key in UniFi Network > Integrations\n  Guide: https://help.ui.com/hc/en-us/articles/30076656117655-Getting-Started-with-the-Official-UniFi-API"
                 )
+            }
+            ApiError::Conflict(msg) => write!(f, "{msg}"),
+            ApiError::Unsupported { endpoint, reason } => {
+                match reason {
+                    UnsupportedReason::NotJson { content_type } => write!(
+                        f,
+                        "This controller does not serve {endpoint}: it answered with \
+                         {content_type} instead of JSON"
+                    )?,
+                    UnsupportedReason::Removed => write!(
+                        f,
+                        "This controller does not serve {endpoint}: it rejected the endpoint \
+                         itself, so no parameter or identifier would change the result"
+                    )?,
+                }
+                if endpoint.contains("/protect/") {
+                    write!(
+                        f,
+                        "\n  Hint: UniFi OS proxies the request to its web UI when the Protect \
+                         application is not installed on the controller"
+                    )?;
+                } else if endpoint.contains("/stat/event") {
+                    write!(
+                        f,
+                        "\n  Hint: UniFi Network 9 removed the REST event log, and this \
+                         controller does not serve /rest/alarm either. The remaining event \
+                         stream is the events WebSocket, which this CLI does not consume"
+                    )?;
+                }
+                Ok(())
             }
             ApiError::Other(msg) => write!(f, "{msg}"),
         }

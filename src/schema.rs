@@ -127,7 +127,10 @@ fn command_metadata() -> HashMap<&'static str, CommandMeta> {
                 ("version", "string"),
             ],
             false,
-            None,
+            Some(
+                "firmware and version carry the same value: firmware is the name \
+                 devices list uses, version the one this command has always used",
+            ),
         ),
     );
     m.insert(
@@ -157,20 +160,9 @@ fn command_metadata() -> HashMap<&'static str, CommandMeta> {
     m.insert(
         "devices ports",
         f(
-            &[
-                ("port_idx", "integer"),
-                ("name", "string"),
-                ("media", "string"),
-                ("up", "boolean"),
-                ("speed", "integer"),
-                ("full_duplex", "boolean"),
-                ("poe_enable", "boolean"),
-                ("poe_power", "number"),
-                ("tx_bytes", "integer"),
-                ("rx_bytes", "integer"),
-            ],
+            fields::PORTS_LIST,
             false,
-            None,
+            Some("Alias for `ports list`; returns a bare JSON array for backward compatibility."),
         ),
     );
     m.insert(
@@ -186,8 +178,110 @@ fn command_metadata() -> HashMap<&'static str, CommandMeta> {
         ),
     );
 
+    // ports
+    m.insert("ports list", f(fields::PORTS_LIST, false, None));
+    let port_forward_fields = &[
+        ("id", "string"),
+        ("name", "string"),
+        ("enabled", "boolean"),
+        ("protocol", "string"),
+        ("source", "string"),
+        ("source_port", "string"),
+        ("external_port", "string"),
+        ("destination", "string"),
+        ("destination_port", "string"),
+        ("interface", "string"),
+        ("logging", "boolean"),
+    ];
+    m.insert("port-forwards list", f(port_forward_fields, false, None));
+    m.insert("port-forwards show", f(port_forward_fields, false, None));
+    m.insert(
+        "ports show",
+        f(
+            &[
+                ("device_mac", "string"),
+                ("device_name", "string"),
+                ("port_idx", "integer"),
+                ("name", "string"),
+                ("media", "string"),
+                ("up", "boolean"),
+                ("speed", "integer"),
+                ("full_duplex", "boolean"),
+                ("autoneg", "boolean"),
+                ("enable", "boolean"),
+                ("is_uplink", "boolean"),
+                ("stp_state", "string"),
+                ("port_poe", "boolean"),
+                ("poe_enable", "boolean"),
+                ("poe_mode", "string"),
+                ("poe_class", "string"),
+                ("poe_power", "number"),
+                ("poe_voltage", "number"),
+                ("poe_current", "number"),
+                ("poe_good", "boolean"),
+                ("attached_mac", "string"),
+                ("attached_last_seen_mac", "string"),
+                ("attached_connected", "boolean"),
+                ("tx_bytes", "integer"),
+                ("rx_bytes", "integer"),
+                ("tx_errors", "integer"),
+                ("rx_errors", "integer"),
+            ],
+            false,
+            None,
+        ),
+    );
+    m.insert("ports find", f(fields::PORTS_FIND, false, None));
+    m.insert(
+        "ports cycle",
+        f(
+            &[
+                ("status", "string"),
+                ("action", "string"),
+                ("mac", "string"),
+                ("port_idx", "integer"),
+            ],
+            true,
+            None,
+        ),
+    );
+
+    m.insert(
+        "ports poe",
+        f(
+            &[
+                ("device", "string"),
+                ("port_idx", "integer"),
+                ("poe_mode_before", "string"),
+                ("poe_mode_after", "string"),
+            ],
+            true,
+            None,
+        ),
+    );
+
     // networks / events / system
     m.insert("networks list", f(fields::NETWORKS_LIST, false, None));
+    m.insert(
+        "networks show",
+        f(
+            &[
+                ("id", "string"),
+                ("name", "string"),
+                ("purpose", "string"),
+                ("vlan_id", "integer"),
+                ("subnet", "string"),
+                ("enabled", "boolean"),
+                ("dhcp_enabled", "boolean"),
+                ("dns_custom", "boolean"),
+                ("dns_servers", "array"),
+                ("mdns_enabled", "boolean"),
+                ("cellular_backup_enabled", "boolean"),
+            ],
+            false,
+            Some("Uses the richer legacy network configuration endpoint and emits only typed, non-secret fields."),
+        ),
+    );
     m.insert("events list", f(fields::EVENTS_LIST, false, None));
     m.insert(
         "system health",
@@ -213,6 +307,39 @@ fn command_metadata() -> HashMap<&'static str, CommandMeta> {
                 ("version", "string"),
                 ("timezone", "string"),
                 ("uptime", "integer"),
+                ("update_available", "boolean"),
+            ],
+            false,
+            Some(
+                "update_available is null when the host system did not report a \
+                 device state, which is not the same as being up to date",
+            ),
+        ),
+    );
+    m.insert(
+        "wan list",
+        f(
+            &[
+                ("slot", "string"),
+                ("name", "string"),
+                ("interface", "string"),
+                ("enabled", "boolean"),
+                ("up", "boolean"),
+                ("ip", "string"),
+                ("availability", "number"),
+                ("latency_ms", "number"),
+                ("speed_mbps", "integer"),
+                ("rx_bytes", "integer"),
+                ("tx_bytes", "integer"),
+                ("rx_rate", "integer"),
+                ("tx_rate", "integer"),
+                ("cellular", "boolean"),
+                ("cellular_state", "string"),
+                ("signal_percent", "number"),
+                ("radio_access", "string"),
+                ("lte_rsrp", "number"),
+                ("lte_rsrq", "number"),
+                ("lte_sinr", "number"),
             ],
             false,
             None,
@@ -278,9 +405,15 @@ fn command_metadata() -> HashMap<&'static str, CommandMeta> {
                 ("action", "string"),
                 ("camera_id", "string"),
                 ("streams", "object"),
+                ("requested", "string[]"),
+                ("not_created", "string[]"),
             ],
             true,
-            None,
+            Some(
+                "status is \"ok\" when every requested quality came back with a URL, \
+                 \"partial\" when some did not; not_created lists those, and the \
+                 command exits non-zero",
+            ),
         ),
     );
     m.insert(
@@ -299,6 +432,18 @@ fn command_metadata() -> HashMap<&'static str, CommandMeta> {
 
     // utility commands
     m.insert("completions", n("Does not require --host or --api-key"));
+    m.insert(
+        "capabilities",
+        f(
+            &[
+                ("applications", "array"),
+                ("resources", "array"),
+                ("structured_output", "boolean"),
+            ],
+            false,
+            Some("Does not require --host or --api-key"),
+        ),
+    );
     m.insert(
         "config init",
         n("Does not require --host or --api-key. Supports named profiles."),
@@ -371,20 +516,24 @@ fn build_global_args(cmd: &clap::Command) -> Vec<serde_json::Value> {
         "name": "--yes",
         "type": "boolean",
         "required": false,
-        "description": "Skip confirmation prompt for destructive commands (required without a TTY)",
+        "description": "Skip the confirmation prompt. Required for any command with confirmation_required: true when stdin is not a terminal; without it those commands exit 2 with kind confirmation_required and send nothing",
     }));
     args
 }
 
 fn infer_arg_type(arg: &clap::Arg) -> &'static str {
     let id = arg.get_id().as_str();
-    // Boolean flags (no value name = flag/switch)
-    if arg.get_value_names().is_none_or(|v| v.is_empty()) {
+    // A flag takes no value. The action is the reliable signal: clap's derive
+    // gives flags a value name too, so an empty value name never matches.
+    if matches!(
+        arg.get_action(),
+        clap::ArgAction::SetTrue | clap::ArgAction::SetFalse
+    ) {
         return "boolean";
     }
     // Known integer args by id
     match id {
-        "limit" | "offset" | "interval" => "integer",
+        "limit" | "offset" | "interval" | "port" | "watch" => "integer",
         _ => "string",
     }
 }
@@ -462,6 +611,16 @@ fn walk_commands(
                     entry["output_fields"] = arr.into();
                 }
                 entry["mutating"] = meta.mutating.into();
+                // Published only for mutating commands, where the answer is
+                // the difference between a run that works unattended and one
+                // that exits 2. The three mutating commands that do not ask
+                // say so explicitly rather than leaving an agent to guess
+                // from the absence of a key.
+                if meta.mutating {
+                    entry["confirmation_required"] = unifi_cli::CONFIRMATION_GATED_COMMANDS
+                        .contains(&path.as_str())
+                        .into();
+                }
                 if let Some(note) = meta.note {
                     entry["note"] = note.into();
                 }
@@ -483,8 +642,8 @@ pub fn print_schema(cmd: clap::Command) {
     let mut commands: Vec<serde_json::Value> = Vec::new();
     walk_commands(&cmd, "", &metadata, &mut commands);
 
-    let schema = serde_json::json!({
-        "clispec": "0.2",
+    let mut schema = serde_json::json!({
+        "clispec": "0.3",
         "name": cmd.get_name(),
         "version": env!("CARGO_PKG_VERSION"),
         "description": cmd.get_about().map(|h| h.to_string()).unwrap_or_default(),
@@ -507,7 +666,7 @@ pub fn print_schema(cmd: clap::Command) {
                 "kind": "confirmation_required",
                 "exit_code": 2,
                 "retryable": false,
-                "description": "Destructive command requires --yes flag when stdin is not a terminal",
+                "description": "Confirmation for a destructive command was not obtained: either --yes was omitted while stdin is not a terminal, or the operator declined at an interactive confirmation prompt",
             },
             {
                 "kind": "auth_error",
@@ -522,21 +681,132 @@ pub fn print_schema(cmd: clap::Command) {
                 "description": "Requested resource not found (404)",
             },
             {
+                "kind": "unsupported",
+                "exit_code": 4,
+                "retryable": false,
+                "description": "The controller does not serve this endpoint at all. It either answered a JSON endpoint with something else, which is how UniFi OS reports an application it does not have, or rejected the endpoint itself, which is how UniFi Network reports one the firmware has dropped. Unlike not_found there is no other identifier or parameter worth trying",
+            },
+            {
+                "kind": "client_error",
+                "exit_code": 5,
+                "retryable": false,
+                "description": "API rejected the request itself (4xx other than 401/403/404/408/429). The request will not succeed unchanged, so retrying cannot help; the HTTP status is in the error message",
+            },
+            {
+                "kind": "retry_later",
+                "exit_code": 5,
+                "retryable": true,
+                "description": "API declined to serve the request now and invited a retry (429 rate limited, 408 request timeout). Back off and retry the same request",
+            },
+            {
                 "kind": "api_error",
                 "exit_code": 5,
                 "retryable": true,
-                "description": "API returned a server-side error (5xx)",
+                "description": "API returned a server-side error (5xx). May be transient",
             },
             {
                 "kind": "conflict",
                 "exit_code": 6,
                 "retryable": false,
-                "description": "Resource already exists with incompatible configuration",
+                "description": "The request cannot succeed against the resource's current state, rejected locally before any API call: an ambiguous match, or a precondition the target does not meet",
             },
         ],
     });
+    enrich_v0_3(&mut schema);
     println!(
         "{}",
         serde_json::to_string_pretty(&schema).expect("failed to serialize schema")
     );
+}
+
+fn enrich_v0_3(schema: &mut serde_json::Value) {
+    schema["output"] = serde_json::json!({"tty":"text","piped":"json"});
+    let Some(commands) = schema["commands"].as_array_mut() else {
+        return;
+    };
+    for command in commands {
+        let Some(object) = command.as_object_mut() else {
+            continue;
+        };
+        let name = object["name"].as_str().unwrap_or_default().to_string();
+        if name == "config init" {
+            object.insert("mutating".into(), serde_json::json!(true));
+        }
+        let mutating = object["mutating"].as_bool().unwrap_or(false);
+        object.insert(
+            "effects".into(),
+            serde_json::json!(if !mutating {
+                "read_only"
+            } else if matches!(
+                name.as_str(),
+                "clients kick" | "ports cycle" | "protect rtsps create"
+            ) {
+                "non_idempotent"
+            } else {
+                "idempotent"
+            }),
+        );
+        if name == "completions" {
+            object.insert("output_kind".into(), serde_json::json!("opaque"));
+            object.insert("media_type".into(), serde_json::json!("text/plain"));
+            continue;
+        }
+        if name == "tui" {
+            object.insert("output_kind".into(), serde_json::json!("stream"));
+            object.insert("stream_format".into(), serde_json::json!("terminal"));
+            object.insert("requires_tty".into(), serde_json::json!(true));
+            continue;
+        }
+        object.insert(
+            "cardinality".into(),
+            serde_json::json!(if name.ends_with(" list") {
+                "bounded"
+            } else {
+                "single"
+            }),
+        );
+        if name == "capabilities" {
+            object.insert(
+                "example".into(),
+                serde_json::json!({"args":["capabilities"]}),
+            );
+        }
+        if name == "schema" {
+            object.insert(
+                "stdout_schema".into(),
+                serde_json::json!({"$ref":"https://clispec.dev/schema/v0.3.json"}),
+            );
+        }
+        if object
+            .remove("confirmation_required")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            object.insert("confirmation_bypass_arg".into(), serde_json::json!("--yes"));
+        }
+        if let Some(fields) = object
+            .get_mut("output_fields")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for field in fields {
+                let Some(field) = field.as_object_mut() else {
+                    continue;
+                };
+                let kind = field
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("string")
+                    .to_string();
+                if let Some(base) = kind.strip_suffix("[]") {
+                    field.insert("type".into(), serde_json::json!("array"));
+                    field.insert("items".into(), serde_json::json!({"type":base}));
+                } else if kind == "array" {
+                    field.insert("items".into(), serde_json::json!({"type":"string"}));
+                }
+            }
+        }
+        if !object.contains_key("output_fields") && !object.contains_key("stdout_schema") {
+            object.insert("stdout_schema".into(), serde_json::json!({}));
+        }
+    }
 }

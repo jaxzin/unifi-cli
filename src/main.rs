@@ -8,7 +8,7 @@ use unifi_cli::output::{
 
 mod schema;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 #[derive(Parser)]
@@ -75,6 +75,14 @@ enum Command {
         command: Option<NetworksCommand>,
     },
 
+    /// Inspect and manage switch ports
+    #[command(subcommand)]
+    Ports(PortsCommand),
+
+    /// Inspect port forwards
+    #[command(subcommand)]
+    PortForwards(PortForwardsCommand),
+
     /// View controller events
     #[command(subcommand)]
     Events(EventsCommand),
@@ -83,12 +91,19 @@ enum Command {
     #[command(subcommand)]
     System(SystemCommand),
 
+    /// Inspect WAN interfaces and failover state
+    #[command(subcommand)]
+    Wan(WanCommand),
+
     /// Manage Protect cameras and RTSPS streams
     #[command(subcommand)]
     Protect(ProtectCommand),
 
     /// Dump all commands and arguments as JSON for agent introspection
     Schema,
+
+    /// Describe supported UniFi applications without loading credentials
+    Capabilities,
 
     /// Generate shell completions
     Completions {
@@ -147,7 +162,7 @@ enum ClientsCommand {
     SetFixedIp {
         /// MAC address (any format: aa:bb:cc:dd:ee:ff, aa-bb-cc-dd-ee-ff, aabbccddeeff)
         mac: String,
-        /// Fixed IP address to assign (e.g., 10.0.0.5)
+        /// Fixed IP address to assign (e.g., 192.0.2.5)
         ip: String,
         /// Friendly name for the client
         #[arg(long)]
@@ -230,6 +245,84 @@ enum DevicesCommand {
 }
 
 #[derive(Subcommand)]
+enum PortsCommand {
+    /// List ports for one device, or across all devices
+    List {
+        /// MAC address of a switch or router. Omit to list every device's ports.
+        mac: Option<String>,
+        /// Maximum number of results to return
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        /// Number of results to skip
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        /// Comma-separated list of fields to include in output (see `unifi schema`)
+        #[arg(long)]
+        fields: Option<String>,
+        /// Live-updating TUI view of port status (requires MAC)
+        #[arg(long, requires = "mac")]
+        live: bool,
+        /// Refresh interval in seconds (only with --live)
+        #[arg(short = 'i', long, default_value = "2")]
+        interval: u64,
+    },
+    /// Show details for a single port
+    Show {
+        /// MAC address of the switch or router
+        mac: String,
+        /// Port index (see `unifi ports list <MAC>`)
+        port: u32,
+    },
+    /// Find which switch port a device is attached to
+    Find {
+        /// MAC address, IP address, or client name
+        identifier: String,
+        /// Comma-separated list of fields to include in output (see `unifi schema`)
+        #[arg(long)]
+        fields: Option<String>,
+    },
+    /// Power-cycle a single PoE port
+    Cycle {
+        /// MAC address of the switch (not the attached device)
+        mac: String,
+        /// Port index (see `unifi ports list <MAC>`)
+        port: u32,
+    },
+    /// Set a single port's PoE mode (off or auto)
+    Poe {
+        /// MAC address of the switch (not the attached device)
+        mac: String,
+        /// Port index (see `unifi ports list <MAC>`)
+        port: u32,
+        /// PoE mode to set
+        mode: PoeMode,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PoeMode {
+    Off,
+    Auto,
+}
+
+impl PoeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PoeMode::Off => "off",
+            PoeMode::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PortForwardsCommand {
+    /// List port forwards
+    List,
+    /// Show one port forward by exact name or ID
+    Show { identifier: String },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommand {
     /// Create or update the configuration file interactively
     Init,
@@ -241,6 +334,11 @@ enum ConfigCommand {
 enum NetworksCommand {
     /// List networks
     List,
+    /// Show network configuration by name or ID
+    Show {
+        /// Network name or controller ID
+        identifier: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -265,6 +363,12 @@ enum SystemCommand {
     Health,
     /// Show system info
     Info,
+}
+
+#[derive(Subcommand)]
+enum WanCommand {
+    /// List WAN interfaces
+    List,
 }
 
 #[derive(Subcommand)]
@@ -323,7 +427,11 @@ enum ProtectRtspsCommand {
 
 /// Check TTY for destructive commands. When stdin is not a terminal and --yes was not
 /// passed, emit a structured error and exit with code 2.
-fn require_confirmation(yes: bool, action: &str) {
+///
+/// For commands that ask their question later, once they have loaded enough
+/// context to describe what is about to change. Commands that can ask straight
+/// away call `require_confirmation` instead.
+fn refuse_without_tty(yes: bool, action: &str) {
     use std::io::IsTerminal;
     if !yes && !std::io::stdin().is_terminal() {
         print_error_envelope(
@@ -333,6 +441,60 @@ fn require_confirmation(yes: bool, action: &str) {
         );
         std::process::exit(exit_codes::CONFIRMATION_REQUIRED);
     }
+}
+
+/// Gate a destructive command behind a confirmation. `--yes` proceeds. Without a
+/// TTY the structured error is emitted and the process exits 2; on a TTY the
+/// question is asked and a decline exits 2 the same way.
+fn require_confirmation(yes: bool, action: &str, question: &str) {
+    refuse_without_tty(yes, action);
+    if yes {
+        return;
+    }
+    let mut stdin = std::io::stdin().lock();
+    let mut stderr = std::io::stderr();
+    let confirmed = confirm_destructive(&mut stdin, &mut stderr, "", question).unwrap_or(false);
+    if !confirmed {
+        print_error_envelope(
+            "confirmation_required",
+            "Aborted: confirmation declined.",
+            None,
+        );
+        std::process::exit(exit_codes::CONFIRMATION_REQUIRED);
+    }
+}
+
+/// Prompt for confirmation of a destructive action. Returns true only on an
+/// explicit yes; an empty line, EOF, or anything else declines.
+///
+/// `summary` is printed above the question when it is non-empty, for callers
+/// that already know which port or device they are about to touch.
+///
+/// Separate from `prompt_line`, which returns `InitError` and belongs to the
+/// config-init flow. Reader/writer are injected so this is unit-testable
+/// without a TTY.
+fn confirm_destructive(
+    reader: &mut dyn std::io::BufRead,
+    writer: &mut dyn std::io::Write,
+    summary: &str,
+    question: &str,
+) -> std::io::Result<bool> {
+    if !summary.is_empty() {
+        writeln!(writer, "{summary}")?;
+    }
+    write!(writer, "{question} (y/N): ")?;
+    writer.flush()?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    // The user's Enter is echoed by the terminal, not written to this stream,
+    // so without this the prompt line above stays unterminated on our writer.
+    // With stdin a TTY and stderr redirected, a decline's error envelope
+    // (printed with `eprintln!` right after) would then land on the same
+    // physical line as the prompt instead of starting fresh, breaking the
+    // "envelope is the last line of stderr" contract (tests/cli_contract.rs,
+    // `error_envelope_last_line_is_json` in tests/spec_compliance.rs).
+    writeln!(writer)?;
+    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 fn print_schema() {
@@ -346,6 +508,8 @@ fn validate_requested_fields(command: &Command) -> Result<Option<Vec<String>>, I
         Command::Clients(ClientsCommand::List { fields, .. }) => (fields, fields::CLIENTS_LIST),
         Command::Devices(DevicesCommand::List { fields, .. }) => (fields, fields::DEVICES_LIST),
         Command::Events(EventsCommand::List { fields, .. }) => (fields, fields::EVENTS_LIST),
+        Command::Ports(PortsCommand::List { fields, .. }) => (fields, fields::PORTS_LIST),
+        Command::Ports(PortsCommand::Find { fields, .. }) => (fields, fields::PORTS_FIND),
         _ => return Ok(None),
     };
 
@@ -530,6 +694,7 @@ fn run_init_with_io(
     config_path: &std::path::Path,
     use_tty: bool,
     accept_invalid_certs: bool,
+    profile_hint: Option<&str>,
 ) -> Result<InitOutcome, InitError> {
     // Load existing config, warn if file exists but is corrupt
     let existing = match std::fs::read_to_string(config_path) {
@@ -549,9 +714,13 @@ fn run_init_with_io(
     };
 
     // Profile name
-    let profile_input = prompt_line(reader, writer, "Profile name (leave empty for default): ")?;
+    let profile_prompt = profile_hint.map_or_else(
+        || "Profile name (leave empty for default): ".to_string(),
+        |name| format!("Profile name [{name}]: "),
+    );
+    let profile_input = prompt_line(reader, writer, &profile_prompt)?;
     let profile_name = if profile_input.is_empty() {
-        None
+        profile_hint.map(str::to_owned)
     } else {
         Some(profile_input)
     };
@@ -575,13 +744,23 @@ fn run_init_with_io(
         host_input
     };
 
+    // Put creation guidance before the prompt: this is the moment a first-time
+    // user needs to leave the CLI and create the value being requested.
+    let show_key_hint = current.api_key.is_none();
+    if show_key_hint {
+        writeln!(
+            writer,
+            "  Create API keys at: UniFi Network \u{2192} Integrations"
+        )?;
+        writeln!(writer, "  Guide: {}", unifi_cli::tui::API_HELP_URL)?;
+    }
+
     // API key prompt (masked input)
     let key_prompt = match current.api_key {
         Some(ref k) => format!("API key [{}]: ", mask_api_key(k)),
         None => "API key: ".to_string(),
     };
     let key_input = prompt_secret(reader, writer, &key_prompt, use_tty)?;
-    let show_key_hint = current.api_key.is_none();
     let api_key = if key_input.is_empty() {
         current
             .api_key
@@ -589,13 +768,6 @@ fn run_init_with_io(
     } else {
         key_input
     };
-    if show_key_hint {
-        writeln!(
-            writer,
-            "  Create API keys at: UniFi Network \u{2192} Settings \u{2192} API"
-        )?;
-    }
-
     // Optional Protect credentials (username/password for --full commands)
     writeln!(writer)?;
     writeln!(
@@ -698,15 +870,7 @@ fn run_init_with_io(
     }
     let toml_str = toml::to_string_pretty(&config)
         .map_err(|e| InitError(format!("Failed to serialize config: {e}")))?;
-    std::fs::write(config_path, &toml_str)
-        .map_err(|e| InitError(format!("Failed to write config: {e}")))?;
-
-    // Restrict config file permissions (contains secrets)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600));
-    }
+    write_config_file(config_path, &toml_str)?;
 
     Ok(InitOutcome::Saved {
         profile: profile_name,
@@ -745,14 +909,85 @@ fn enable_accept_invalid_certs_in_config(
 
     let toml_str = toml::to_string_pretty(&config)
         .map_err(|e| InitError(format!("Failed to serialize config: {e}")))?;
-    std::fs::write(config_path, &toml_str)
-        .map_err(|e| InitError(format!("Failed to write config: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600));
+    write_config_file(config_path, &toml_str)
+}
+
+/// Write the config file so that only its owner can read it.
+///
+/// The file holds an API key and optionally a password, so it is never written
+/// in place. `OpenOptions::mode` applies only to a file the call creates, so
+/// opening an existing config would fill a possibly world-readable file with
+/// fresh credentials and only tighten it afterwards, leaving a window in which
+/// any local account can read the key (and leaving it readable for good if the
+/// chmod fails). Instead the content goes into a new 0600 file beside the
+/// destination and is renamed over it. The rename is atomic: the credentials
+/// exist only inside a 0600 file, and a concurrent reader sees either the old
+/// config or the new one, never a half-written one.
+///
+/// Off unix the write goes through the same temp file and rename, so the config
+/// is never left half-written, but the mode is not set: the file takes the
+/// inherited ACL of its directory.
+fn write_config_file(config_path: &std::path::Path, toml_str: &str) -> Result<(), InitError> {
+    use std::io::Write;
+
+    // The temp file must share a directory with the destination, since rename
+    // does not cross filesystems.
+    let dir = match config_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    let name = config_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+    // Unique per process and per call, so two writers never pick the same name.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+
+    let open_tmp = || {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp_path)
+    };
+    let opened = match open_tmp() {
+        // A temp file left behind by a killed run. Reclaim the name;
+        // `create_new` still guarantees we write a file we created ourselves.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp_path)
+                .map_err(|e| InitError(format!("Failed to write config: {e}")))?;
+            open_tmp()
+        }
+        other => other,
+    };
+
+    let write_tmp = |mut file: std::fs::File| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            // The umask can clear bits from the requested mode, so pin it here.
+            // The file is still empty, so no secret has reached the disk yet.
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(toml_str.as_bytes())?;
+        file.sync_all()
+    };
+
+    match opened.and_then(write_tmp) {
+        Ok(()) => std::fs::rename(&tmp_path, config_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            InitError(format!("Failed to write config: {e}"))
+        }),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(InitError(format!("Failed to write config: {e}")))
+        }
     }
-    Ok(())
 }
 
 /// Prompt for a yes/no answer on stderr (where init status is shown) and read
@@ -768,7 +1003,7 @@ fn prompt_yes_no_stderr(reader: &mut dyn std::io::BufRead, prompt: &str) -> bool
     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-async fn run_init(accept_invalid_certs: bool) {
+async fn run_init(accept_invalid_certs: bool, profile_hint: Option<&str>) -> bool {
     let path = match default_config_path() {
         Ok(p) => p,
         Err(e) => {
@@ -791,6 +1026,7 @@ async fn run_init(accept_invalid_certs: bool) {
         &path,
         use_tty,
         accept_invalid_certs,
+        profile_hint,
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -805,7 +1041,7 @@ async fn run_init(accept_invalid_certs: bool) {
             host,
             api_key,
         } => (profile, host, api_key),
-        InitOutcome::Cancelled => return,
+        InitOutcome::Cancelled => return false,
     };
 
     // Validate credentials against the API. On a TLS certificate failure (common
@@ -920,6 +1156,7 @@ async fn run_init(accept_invalid_certs: bool) {
         sym_dim("# shell completions")
     );
     eprintln!();
+    true
 }
 
 fn mask_api_key(key: &str) -> String {
@@ -1053,7 +1290,8 @@ async fn run_config_check(client: &api::UnifiClient) {
         }
         Err(api::ApiError::Auth(msg)) => {
             eprintln!("  \u{2718} Authentication failed: {msg}");
-            eprintln!("\n  Hint: Check your API key. Generate one in UniFi Settings > API");
+            eprintln!("\n  Hint: Create or replace the key in UniFi Network > Integrations");
+            eprintln!("  Guide: {}", unifi_cli::tui::API_HELP_URL);
             std::process::exit(exit_codes::AUTH_ERROR);
         }
         Err(e) => {
@@ -1077,8 +1315,31 @@ async fn run_config_check(client: &api::UnifiClient) {
     eprintln!("\nConfiguration is valid.");
 }
 
+/// Restore the default disposition for SIGPIPE, which Rust ignores at startup.
+///
+/// While it is ignored, the first write after a reader closes the pipe fails
+/// with EPIPE and the standard library turns that into a panic. `unifi clients
+/// list | head -5`, or any consumer that exits early, would then print a stack
+/// trace and exit 101, which reads as this tool failing rather than as the
+/// ordinary end of a pipeline. With the default restored the process is simply
+/// terminated by the signal, which is what every other command-line tool does.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: called before the tokio runtime starts any thread, and setting a
+    // disposition to SIG_DFL touches nothing else in the process.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+fn main() {
+    #[cfg(unix)]
+    restore_default_sigpipe();
+    run();
+}
+
 #[tokio::main]
-async fn main() {
+async fn run() {
     let cli = Cli::try_parse().unwrap_or_else(|e| {
         // Help and version are not errors; let clap handle them normally.
         if matches!(
@@ -1115,6 +1376,24 @@ async fn main() {
             print_schema();
             return;
         }
+        Command::Capabilities => {
+            let value = serde_json::json!({
+                "applications": ["network", "protect"],
+                "resources": ["clients", "devices", "networks", "ports", "events", "cameras", "rtsps"],
+                "structured_output": true
+            });
+            if out.is_json() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("serialize capabilities")
+                );
+            } else {
+                println!(
+                    "Applications: Network, Protect\nResources: clients, devices, networks, ports, events, cameras, RTSPS"
+                );
+            }
+            return;
+        }
         Command::Completions { shell, install } => {
             if *install {
                 install_completions(*shell);
@@ -1129,7 +1408,23 @@ async fn main() {
             return;
         }
         Command::Config(ConfigCommand::Init) => {
-            run_init(cli.accept_invalid_certs).await;
+            run_init(cli.accept_invalid_certs, cli.profile.as_deref()).await;
+            return;
+        }
+        Command::Tui { interval } => {
+            let result = run_tui_command(
+                cli.host.clone(),
+                cli.api_key.clone(),
+                cli.profile.clone(),
+                cli.accept_invalid_certs,
+                *interval,
+            )
+            .await;
+            if let Err(error) = result {
+                let (kind, exit_code) = error_kind_and_code(error.as_ref());
+                print_error_envelope(kind, &error.to_string(), None);
+                std::process::exit(exit_code);
+            }
             return;
         }
         _ => {}
@@ -1166,7 +1461,8 @@ async fn main() {
         eprintln!("  - Set UNIFI_API_KEY environment variable");
         eprintln!("  - Use --api-key flag");
         eprintln!();
-        eprintln!("  Generate an API key in UniFi Settings > API");
+        eprintln!("  Create an API key in UniFi Network > Integrations");
+        eprintln!("  Guide: {}", unifi_cli::tui::API_HELP_URL);
         std::process::exit(exit_codes::CONFIG_ERROR);
     });
 
@@ -1216,15 +1512,15 @@ async fn main() {
                 commands::clients::set_fixed_ip(&client, &mac, &ip, name.as_deref(), out).await
             }
             ClientsCommand::Block { mac } => {
-                require_confirmation(cli.yes, "block");
+                require_confirmation(cli.yes, "block", &format!("Block client {mac}?"));
                 commands::clients::block(&client, &mac, out).await
             }
             ClientsCommand::Unblock { mac } => {
-                require_confirmation(cli.yes, "unblock");
+                require_confirmation(cli.yes, "unblock", &format!("Unblock client {mac}?"));
                 commands::clients::unblock(&client, &mac, out).await
             }
             ClientsCommand::Kick { mac } => {
-                require_confirmation(cli.yes, "kick");
+                require_confirmation(cli.yes, "kick", &format!("Disconnect client {mac}?"));
                 commands::clients::kick(&client, &mac, out).await
             }
             ClientsCommand::Top { limit } => commands::clients::top(&client, out, limit).await,
@@ -1245,7 +1541,7 @@ async fn main() {
             }
             DevicesCommand::Show { mac } => commands::devices::show(&client, &mac, out).await,
             DevicesCommand::Restart { mac } => {
-                require_confirmation(cli.yes, "restart");
+                require_confirmation(cli.yes, "restart", &format!("Restart device {mac}?"));
                 commands::devices::restart(&client, &mac, out).await
             }
             DevicesCommand::Locate { mac, off } => {
@@ -1263,11 +1559,125 @@ async fn main() {
                 }
             }
             DevicesCommand::Upgrade { mac } => {
-                require_confirmation(cli.yes, "upgrade");
+                require_confirmation(cli.yes, "upgrade", &format!("Upgrade firmware on {mac}?"));
                 commands::devices::upgrade(&client, &mac, out).await
             }
         },
-        Command::Networks { .. } => commands::networks::list(&mut client, out).await,
+        Command::Networks { command } => match command.unwrap_or(NetworksCommand::List) {
+            NetworksCommand::List => commands::networks::list(&mut client, out).await,
+            NetworksCommand::Show { identifier } => {
+                commands::networks::show(&client, &identifier, out).await
+            }
+        },
+        Command::Ports(cmd) => match cmd {
+            PortsCommand::List {
+                mac,
+                limit,
+                offset,
+                fields: _,
+                live,
+                interval,
+            } => {
+                if live {
+                    let mac = mac.expect("clap requires --live to be paired with a MAC");
+                    unifi_cli::tui::run_ports(&client, &mac, interval).await
+                } else {
+                    let pagination = commands::ports::Pagination {
+                        limit,
+                        offset,
+                        fields: requested_fields,
+                    };
+                    commands::ports::list(&client, mac.as_deref(), out, pagination).await
+                }
+            }
+            PortsCommand::Show { mac, port } => {
+                commands::ports::show(&client, &mac, port, out).await
+            }
+            PortsCommand::Find { identifier, .. } => {
+                commands::ports::find(&client, &identifier, out, requested_fields).await
+            }
+            PortsCommand::Cycle { mac, port } => {
+                // Asks after the port table is read, so the prompt can name what
+                // is attached; the TTY gate still has to run before any HTTP.
+                refuse_without_tty(cli.yes, "power-cycle");
+                let skip_prompt = cli.yes;
+                let outcome = commands::ports::cycle(&client, &mac, port, out, |summary| {
+                    if skip_prompt {
+                        return Ok(true);
+                    }
+                    // Reached only on a TTY: refuse_without_tty already
+                    // exited for the piped-without---yes case.
+                    let mut stdin = std::io::stdin().lock();
+                    let mut stderr = std::io::stderr();
+                    confirm_destructive(&mut stdin, &mut stderr, summary, "Power-cycle this port?")
+                })
+                .await;
+
+                // main() returns (), so `?` cannot be used here; match keeps
+                // this arm's value the same `Result<(), Box<dyn Error>>` every
+                // other arm produces, so errors still flow through the single
+                // `if let Err(e) = result` handler below.
+                match outcome {
+                    Ok(commands::ports::CycleOutcome::Cycled) => Ok(()),
+                    Ok(commands::ports::CycleOutcome::Declined) => {
+                        print_error_envelope(
+                            "confirmation_required",
+                            "Aborted: confirmation declined.",
+                            None,
+                        );
+                        std::process::exit(exit_codes::CONFIRMATION_REQUIRED);
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            PortsCommand::Poe { mac, port, mode } => {
+                refuse_without_tty(cli.yes, "poe");
+                let skip_prompt = cli.yes;
+                let outcome = commands::ports::poe(
+                    &client,
+                    &mac,
+                    port,
+                    mode.as_str(),
+                    out,
+                    commands::ports::VerifyPolicy::default(),
+                    |summary| {
+                        if skip_prompt {
+                            return Ok(true);
+                        }
+                        let mut stdin = std::io::stdin().lock();
+                        let mut stderr = std::io::stderr();
+                        confirm_destructive(
+                            &mut stdin,
+                            &mut stderr,
+                            summary,
+                            "Change this port's PoE mode?",
+                        )
+                    },
+                )
+                .await;
+                match outcome {
+                    Ok(
+                        commands::ports::PoeOutcome::Changed
+                        | commands::ports::PoeOutcome::Unchanged,
+                    ) => Ok(()),
+                    Ok(commands::ports::PoeOutcome::Declined) => {
+                        print_error_envelope(
+                            "confirmation_required",
+                            "Aborted: confirmation declined.",
+                            None,
+                        );
+                        std::process::exit(exit_codes::CONFIRMATION_REQUIRED);
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        },
+        Command::PortForwards(cmd) => match cmd {
+            PortForwardsCommand::List => commands::port_forwards::list(&client, out).await,
+            PortForwardsCommand::Show { identifier } => {
+                commands::port_forwards::show(&client, &identifier, out).await
+            }
+        },
         Command::Events(cmd) => match cmd {
             EventsCommand::List {
                 limit,
@@ -1286,6 +1696,7 @@ async fn main() {
             SystemCommand::Health => commands::system::health(&client, out).await,
             SystemCommand::Info => commands::system::info(&client, out).await,
         },
+        Command::Wan(WanCommand::List) => commands::wan::list(&client, out).await,
         Command::Protect(cmd) => match cmd {
             ProtectCommand::Cameras(cam_cmd) => match cam_cmd {
                 ProtectCamerasCommand::List { full } => {
@@ -1317,17 +1728,24 @@ async fn main() {
                     commands::protect::rtsps_create(&client, &camera, &quality, out).await
                 }
                 ProtectRtspsCommand::Delete { camera, quality } => {
-                    require_confirmation(cli.yes, "rtsps delete");
+                    require_confirmation(
+                        cli.yes,
+                        "rtsps delete",
+                        &format!("Delete {} RTSPS stream(s) on {camera}?", quality.join(", ")),
+                    );
                     commands::protect::rtsps_delete(&client, &camera, &quality, out).await
                 }
             },
         },
-        Command::Tui { interval } => unifi_cli::tui::run(&client, interval).await,
+        Command::Tui { .. } => unreachable!("TUI commands return before shared client setup"),
         Command::Config(ConfigCommand::Check) => {
             run_config_check(&client).await;
             return;
         }
-        Command::Schema | Command::Completions { .. } | Command::Config(ConfigCommand::Init) => {
+        Command::Schema
+        | Command::Capabilities
+        | Command::Completions { .. }
+        | Command::Config(ConfigCommand::Init) => {
             unreachable!()
         }
     };
@@ -1336,6 +1754,68 @@ async fn main() {
         let (kind, exit_code) = error_kind_and_code(e.as_ref());
         print_error_envelope(kind, &e.to_string(), None);
         std::process::exit(exit_code);
+    }
+}
+
+async fn run_tui_command(
+    mut host_arg: Option<String>,
+    mut api_key_arg: Option<String>,
+    profile: Option<String>,
+    accept_invalid_certs: bool,
+    interval: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(Box::new(api::ApiError::Other(
+            "the TUI requires an interactive terminal on stdin and stdout".into(),
+        )));
+    }
+
+    loop {
+        let config = load_config(profile.as_deref());
+        let host = host_arg.clone().or(config.host);
+        let api_key = api_key_arg.clone().or(config.api_key);
+        let reason = match (&host, &api_key) {
+            (None, None) => "No controller or API key is configured yet.",
+            (None, Some(_)) => "This profile has an API key but no controller address.",
+            (Some(_), None) => "This controller does not have an API key yet.",
+            (Some(_), Some(_)) => "",
+        };
+        if !reason.is_empty() {
+            if unifi_cli::tui::request_configuration(profile.as_deref(), host.as_deref(), reason)?
+                == unifi_cli::tui::TuiExit::Quit
+            {
+                return Ok(());
+            }
+            if !run_init(accept_invalid_certs, profile.as_deref()).await {
+                return Ok(());
+            }
+            host_arg = None;
+            api_key_arg = None;
+            continue;
+        }
+
+        let host = host.expect("checked above");
+        let api_key = api_key.expect("checked above");
+        let client = api::UnifiClient::new_with_options(
+            &host,
+            &api_key,
+            api::ClientOptions {
+                accept_invalid_certs: accept_invalid_certs || config.accept_invalid_certs,
+            },
+        )?;
+        match unifi_cli::tui::run(&client, interval).await? {
+            unifi_cli::tui::TuiExit::Quit => return Ok(()),
+            unifi_cli::tui::TuiExit::Configure => {
+                if !run_init(accept_invalid_certs, profile.as_deref()).await {
+                    return Ok(());
+                }
+                // Choosing configuration explicitly means the newly saved
+                // values should replace any stale command-line overrides.
+                host_arg = None;
+                api_key_arg = None;
+            }
+        }
     }
 }
 
@@ -1497,6 +1977,113 @@ api_key = "work_key"
         assert_eq!(host.as_deref(), Some("work.example.com"));
     }
 
+    // --- confirm_destructive ---
+
+    #[test]
+    fn confirm_destructive_accepts_y_and_yes() {
+        for input in ["y\n", "Y\n", "yes\n", "YES\n"] {
+            let mut reader = std::io::BufReader::new(input.as_bytes());
+            let mut writer: Vec<u8> = Vec::new();
+            assert!(
+                confirm_destructive(&mut reader, &mut writer, "Port 4", "Power-cycle this port?")
+                    .unwrap(),
+                "{input:?} must confirm"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_destructive_declines_everything_else() {
+        for input in ["n\n", "no\n", "\n", "maybe\n", ""] {
+            let mut reader = std::io::BufReader::new(input.as_bytes());
+            let mut writer: Vec<u8> = Vec::new();
+            assert!(
+                !confirm_destructive(&mut reader, &mut writer, "Port 4", "Power-cycle this port?")
+                    .unwrap(),
+                "{input:?} must decline"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_destructive_shows_the_summary_and_default_no() {
+        let mut reader = std::io::BufReader::new(&b"n\n"[..]);
+        let mut writer: Vec<u8> = Vec::new();
+        confirm_destructive(
+            &mut reader,
+            &mut writer,
+            "Port 4 on SwitchA",
+            "Power-cycle this port?",
+        )
+        .unwrap();
+        let shown = String::from_utf8(writer).unwrap();
+        assert!(shown.contains("Port 4 on SwitchA"), "got: {shown}");
+        assert!(shown.contains("Power-cycle this port?"), "got: {shown}");
+        assert!(shown.contains("(y/N)"), "default must read as No: {shown}");
+    }
+
+    #[test]
+    fn confirm_destructive_asks_the_question_it_was_given() {
+        // The question is per-command, so a caller that gates `clients block`
+        // must not be able to show the power-cycle wording.
+        let mut reader = std::io::BufReader::new(&b"n\n"[..]);
+        let mut writer: Vec<u8> = Vec::new();
+        confirm_destructive(
+            &mut reader,
+            &mut writer,
+            "",
+            "Block client aa:bb:cc:dd:ee:ff?",
+        )
+        .unwrap();
+        let shown = String::from_utf8(writer).unwrap();
+        assert!(
+            shown.contains("Block client aa:bb:cc:dd:ee:ff?"),
+            "got: {shown}"
+        );
+        assert!(
+            !shown.to_lowercase().contains("power-cycle"),
+            "must not leak another command's wording: {shown}"
+        );
+    }
+
+    #[test]
+    fn confirm_destructive_omits_an_empty_summary_line() {
+        // Commands that gate before loading any context pass no summary. A
+        // blank line above the question would read as a rendering glitch.
+        let mut reader = std::io::BufReader::new(&b"n\n"[..]);
+        let mut writer: Vec<u8> = Vec::new();
+        confirm_destructive(&mut reader, &mut writer, "", "Restart device X?").unwrap();
+        let shown = String::from_utf8(writer).unwrap();
+        assert!(
+            shown.starts_with("Restart device X?"),
+            "question must be the first thing written: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn confirm_destructive_terminates_the_prompt_line_with_a_newline() {
+        // The user's Enter is echoed by the terminal, not by this writer, so
+        // the prompt's own `write!` leaves the stream mid-line unless
+        // `confirm_destructive` terminates it itself. A subsequent
+        // `eprintln!` (e.g. the confirmation_required envelope printed on
+        // decline) must start on a fresh line, not get appended to the
+        // prompt.
+        let mut reader = std::io::BufReader::new(&b"n\n"[..]);
+        let mut writer: Vec<u8> = Vec::new();
+        confirm_destructive(
+            &mut reader,
+            &mut writer,
+            "Port 4 on SwitchA",
+            "Power-cycle this port?",
+        )
+        .unwrap();
+        let shown = String::from_utf8(writer).unwrap();
+        assert!(
+            shown.ends_with('\n'),
+            "prompt output must end with a newline so a following line starts clean: {shown:?}"
+        );
+    }
+
     // --- mask_api_key ---
 
     #[test]
@@ -1541,11 +2128,45 @@ api_key = "work_key"
         let mut reader = std::io::Cursor::new(input.as_bytes().to_vec());
         let mut output = Vec::new();
 
-        let result = run_init_with_io(&mut reader, &mut output, &path, false, false).unwrap();
+        let result = run_init_with_io(&mut reader, &mut output, &path, false, false, None).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap_or_default();
         let display = String::from_utf8(output).unwrap();
         (result, written, display)
+    }
+
+    #[test]
+    fn init_profile_hint_is_the_default_when_recovering_from_the_tui() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut reader =
+            std::io::Cursor::new(b"\nhttps://office.local\noffice-api-key\n\ny\n".to_vec());
+        let mut output = Vec::new();
+
+        let result = run_init_with_io(
+            &mut reader,
+            &mut output,
+            &path,
+            false,
+            false,
+            Some("office"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            InitOutcome::Saved {
+                profile: Some(ref name),
+                ..
+            } if name == "office"
+        ));
+        let written = std::fs::read_to_string(path).unwrap();
+        assert!(written.contains("[profiles.office]"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("Profile name [office]")
+        );
     }
 
     #[test]
@@ -1564,6 +2185,92 @@ api_key = "work_key"
         assert!(!display.contains("secret"));
     }
 
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_writes_credentials_readable_only_by_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut reader = std::io::Cursor::new(b"\nhttps://unifi.local\nmy-api-key\n\ny\n".to_vec());
+        let mut output = Vec::new();
+
+        run_init_with_io(&mut reader, &mut output, &path, false, false, None).unwrap();
+
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("my-api-key")
+        );
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_tightens_permissions_of_a_preexisting_world_readable_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "host = \"https://unifi.local\"\napi_key = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut reader = std::io::Cursor::new(b"\nhttps://unifi.local\nnew-key\n\ny\n".to_vec());
+        let mut output = Vec::new();
+        run_init_with_io(&mut reader, &mut output, &path, false, false, None).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_keeps_credentials_out_of_a_preexisting_world_readable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "host = \"https://unifi.local\"\napi_key = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A second name for the same inode. Writing the new key into the file
+        // that already exists, even for the instant before a chmod, shows up
+        // here; replacing that file by rename cannot.
+        let witness = dir.path().join("witness.toml");
+        std::fs::hard_link(&path, &witness).unwrap();
+
+        let mut reader = std::io::Cursor::new(b"\nhttps://unifi.local\nnew-key\n\ny\n".to_vec());
+        let mut output = Vec::new();
+        run_init_with_io(&mut reader, &mut output, &path, false, false, None).unwrap();
+
+        let exposed = std::fs::read_to_string(&witness).unwrap();
+        assert!(
+            !exposed.contains("new-key"),
+            "the API key was written into a world-readable file: {exposed}"
+        );
+        assert_eq!(
+            mode_of(&witness),
+            0o644,
+            "the world-readable file was the one that got written"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("new-key"));
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enable_accept_invalid_certs_keeps_the_config_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "host = \"https://unifi.local\"\napi_key = \"k\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        enable_accept_invalid_certs_in_config(&path, None).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
     #[test]
     fn init_persists_explicit_invalid_cert_opt_out() {
         let dir = tempfile::tempdir().unwrap();
@@ -1572,7 +2279,7 @@ api_key = "work_key"
         let mut reader = std::io::Cursor::new(input.as_bytes().to_vec());
         let mut output = Vec::new();
 
-        run_init_with_io(&mut reader, &mut output, &path, false, true).unwrap();
+        run_init_with_io(&mut reader, &mut output, &path, false, true, None).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap_or_default();
         let display = String::from_utf8(output).unwrap();
@@ -1661,6 +2368,8 @@ api_key = "work_key"
         assert!(written.contains("host = \"https://unifi.local\""));
         assert!(written.contains("api_key = \"my-api-key\""));
         assert!(display.contains("Create API keys at"));
+        assert!(display.contains(unifi_cli::tui::API_HELP_URL));
+        assert!(display.find("Guide:").unwrap() < display.find("API key:").unwrap());
     }
 
     #[test]
@@ -1775,7 +2484,7 @@ api_key = "work_key"
         let mut reader = std::io::Cursor::new(input.as_bytes().to_vec());
         let mut output = Vec::new();
 
-        let result = run_init_with_io(&mut reader, &mut output, &path, false, false);
+        let result = run_init_with_io(&mut reader, &mut output, &path, false, false, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Host is required"));
     }
@@ -1788,7 +2497,7 @@ api_key = "work_key"
         let mut reader = std::io::Cursor::new(input.as_bytes().to_vec());
         let mut output = Vec::new();
 
-        let result = run_init_with_io(&mut reader, &mut output, &path, false, false);
+        let result = run_init_with_io(&mut reader, &mut output, &path, false, false, None);
         assert!(result.is_err());
         assert!(
             result
@@ -1848,14 +2557,14 @@ api_key = "work_key"
             "clients",
             "set-fixed-ip",
             "aa:bb:cc:dd:ee:ff",
-            "10.0.0.5",
+            "192.0.2.5",
             "--name",
             "MyDevice",
         ]);
         match cli.command {
             Command::Clients(ClientsCommand::SetFixedIp { mac, ip, name }) => {
                 assert_eq!(mac, "aa:bb:cc:dd:ee:ff");
-                assert_eq!(ip, "10.0.0.5");
+                assert_eq!(ip, "192.0.2.5");
                 assert_eq!(name.as_deref(), Some("MyDevice"));
             }
             _ => panic!("expected Clients SetFixedIp"),
@@ -1873,7 +2582,7 @@ api_key = "work_key"
             "clients",
             "set-fixed-ip",
             "aa:bb:cc:dd:ee:ff",
-            "10.0.0.5",
+            "192.0.2.5",
         ]);
         match cli.command {
             Command::Clients(ClientsCommand::SetFixedIp { name, .. }) => assert!(name.is_none()),
@@ -2490,6 +3199,34 @@ api_key = "work_key"
     }
 
     #[test]
+    fn cli_parses_ports_list_without_mac() {
+        let cli = Cli::parse_from(["unifi", "ports", "list"]);
+        match cli.command {
+            Command::Ports(PortsCommand::List { mac, limit, .. }) => {
+                assert!(mac.is_none());
+                assert_eq!(limit, 100);
+            }
+            _ => panic!("expected Ports List"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_ports_list_with_mac() {
+        let cli = Cli::parse_from(["unifi", "ports", "list", "aa:bb:cc:dd:ee:ff"]);
+        match cli.command {
+            Command::Ports(PortsCommand::List { mac, .. }) => {
+                assert_eq!(mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+            }
+            _ => panic!("expected Ports List"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_ports_live_without_mac() {
+        assert!(Cli::try_parse_from(["unifi", "ports", "list", "--live"]).is_err());
+    }
+
+    #[test]
     fn cli_devices_upgrade() {
         let cli = parse(&[
             "unifi",
@@ -2694,8 +3431,8 @@ accept_invalid_certs = true
 
     #[test]
     fn client_new_adds_https_for_ip() {
-        let client = api::UnifiClient::new("192.168.1.1", "key").unwrap();
-        assert_eq!(client.base_url(), "https://192.168.1.1");
+        let client = api::UnifiClient::new("198.51.100.1", "key").unwrap();
+        assert_eq!(client.base_url(), "https://198.51.100.1");
     }
 
     #[test]

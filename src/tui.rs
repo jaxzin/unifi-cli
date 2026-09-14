@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -12,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 
 use crate::api::{
     ApiError, HealthSubsystem, HostSystem, LegacyClient, LegacyDevice, SysInfo, UnifiClient,
@@ -58,17 +59,36 @@ impl SortMode {
     }
 }
 
+/// An open panel, pinned to the entity it was opened on.
+///
+/// Overlays outlive the background refresh that replaces both lists underneath
+/// them, and neither list keeps its order: clients are sorted by live byte
+/// counters, devices arrive in whatever order the controller sends. An overlay
+/// holding a row position would therefore aim its kick, block, AP lock, restart
+/// or locate at whichever entity had moved into that row. Each variant carries
+/// an identity instead: the client's `_id`, which the controller always
+/// reports, and the device's normalized MAC.
 enum Overlay {
-    ClientDetail(usize),
-    DeviceDetail(usize),
+    ClientDetail(String),
+    DeviceDetail(String),
     ApPicker {
-        client_idx: usize,
+        client_id: String,
+        /// The AP list as it was rendered when the picker opened. Choosing from
+        /// a snapshot keeps the highlighted row and the AP that gets locked the
+        /// same entry no matter what a refresh does to the device list.
+        aps: Vec<ApChoice>,
         ap_cursor: usize,
     },
     Confirm {
         message: String,
         action: PendingAction,
     },
+}
+
+/// One selectable access point in the AP picker.
+struct ApChoice {
+    mac: String,
+    name: String,
 }
 
 enum PendingAction {
@@ -96,8 +116,17 @@ enum DeviceAction {
 enum InputOutcome {
     Continue,
     Quit,
+    Configure,
     Spawn(PendingAction),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiExit {
+    Quit,
+    Configure,
+}
+
+pub const API_HELP_URL: &str = "https://help.ui.com/hc/en-us/articles/30076656117655-Getting-Started-with-the-Official-UniFi-API";
 
 struct AppState {
     sysinfo: Option<SysInfo>,
@@ -105,6 +134,12 @@ struct AppState {
     health: Vec<HealthSubsystem>,
     clients: Vec<LegacyClient>,
     devices: Vec<LegacyDevice>,
+    /// Why the health strip or the device list is missing or stale, when a
+    /// refresh fetched the rest of the dashboard but not that section. An empty
+    /// list is a claim about the network, so a section that failed says so
+    /// rather than letting the previous or the empty value pass for current.
+    health_error: Option<String>,
+    devices_error: Option<String>,
     device_names: HashMap<String, String>, // normalized MAC -> device name
     focus: Panel,
     sort: SortMode,
@@ -116,6 +151,7 @@ struct AppState {
     overlay: Option<Overlay>,
     loading: bool,
     last_error: Option<String>,
+    auth_failed: bool,
     status_msg: Option<(String, Instant)>,
     locating: HashMap<String, bool>,
 }
@@ -128,6 +164,8 @@ impl AppState {
             health: Vec::new(),
             clients: Vec::new(),
             devices: Vec::new(),
+            health_error: None,
+            devices_error: None,
             device_names: HashMap::new(),
             focus: Panel::Clients,
             sort: SortMode::Bandwidth,
@@ -139,9 +177,40 @@ impl AppState {
             overlay: None,
             loading: true,
             last_error: None,
+            auth_failed: false,
             status_msg: None,
             locating: HashMap::new(),
         }
+    }
+
+    /// Takes a completed refresh.
+    ///
+    /// A section the controller failed to serve keeps whatever was last known
+    /// and records why, so the panel can say the data is stale. Replacing it
+    /// with an empty list would turn a failed request into "no devices", which
+    /// is a different fact and one the dashboard has no evidence for.
+    fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        self.loading = false;
+        self.sysinfo = snapshot.sysinfo;
+        self.host_system = snapshot.host_system;
+        self.clients = snapshot.clients;
+        match snapshot.health {
+            Ok(health) => {
+                self.health = health;
+                self.health_error = None;
+            }
+            Err(e) => self.health_error = Some(e),
+        }
+        match snapshot.devices {
+            Ok(devices) => {
+                self.devices = devices;
+                self.devices_error = None;
+                self.rebuild_device_names();
+            }
+            Err(e) => self.devices_error = Some(e),
+        }
+        self.last_error = None;
+        self.auth_failed = false;
     }
 
     fn rebuild_device_names(&mut self) {
@@ -180,6 +249,9 @@ impl AppState {
 
         match self.sort {
             SortMode::Bandwidth => {
+                // Sorting needs a total order, so a client with no reported
+                // counters sorts as the quietest. The row itself says the
+                // total is unknown rather than showing it as zero.
                 clients.sort_by(|a, b| {
                     let total_a = a.tx_bytes.unwrap_or(0) + a.rx_bytes.unwrap_or(0);
                     let total_b = b.tx_bytes.unwrap_or(0) + b.rx_bytes.unwrap_or(0);
@@ -206,6 +278,35 @@ impl AppState {
             .iter()
             .filter(|d| d.device_type.as_deref().is_some_and(|t| t == "uap"))
             .collect()
+    }
+
+    /// The APs an open picker offers, captured at the moment it opens.
+    fn ap_choices(&self) -> Vec<ApChoice> {
+        self.ap_devices()
+            .iter()
+            .filter_map(|d| {
+                Some(ApChoice {
+                    mac: d.mac.clone()?,
+                    name: d.name.as_deref().unwrap_or("-").to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// Look up a client by the identity an overlay pinned. The search covers
+    /// every known client, not the filtered view, so a client that a refresh
+    /// pushed out of the filter is still the one an open panel acts on.
+    fn client_by_id(&self, id: &str) -> Option<&LegacyClient> {
+        self.clients.iter().find(|c| c.id == id)
+    }
+
+    /// Look up a device by normalized MAC, the identity an overlay pinned.
+    fn device_by_mac(&self, normalized: &str) -> Option<&LegacyDevice> {
+        self.devices.iter().find(|d| {
+            d.mac
+                .as_deref()
+                .is_some_and(|m| crate::api::normalize_mac(m) == normalized)
+        })
     }
 
     fn cursor_up(&mut self) {
@@ -275,6 +376,16 @@ impl AppState {
     /// effects (quit, spawn an async action) without performing them, so the
     /// full input behavior can be exercised in tests without a terminal.
     fn handle_key(&mut self, key: KeyEvent) -> InputOutcome {
+        if self.auth_failed {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('a') => InputOutcome::Configure,
+                KeyCode::Char('q') | KeyCode::Esc => InputOutcome::Quit,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    InputOutcome::Quit
+                }
+                _ => InputOutcome::Continue,
+            };
+        }
         if self.filtering {
             match key.code {
                 KeyCode::Esc => {
@@ -299,44 +410,35 @@ impl AppState {
         if self.overlay.is_some() {
             // ApPicker has its own navigation and selection handling.
             if let Some(Overlay::ApPicker {
-                client_idx,
+                client_id,
+                aps,
                 ap_cursor,
-            }) = &self.overlay
+            }) = &mut self.overlay
             {
-                let client_idx = *client_idx;
-                let ap_cursor = *ap_cursor;
                 match key.code {
                     KeyCode::Esc => {
-                        self.overlay = Some(Overlay::ClientDetail(client_idx));
+                        let client_id = client_id.clone();
+                        self.overlay = Some(Overlay::ClientDetail(client_id));
                     }
                     KeyCode::Char('q') => return InputOutcome::Quit,
                     KeyCode::Up | KeyCode::Char('k') => {
-                        self.overlay = Some(Overlay::ApPicker {
-                            client_idx,
-                            ap_cursor: ap_cursor.saturating_sub(1),
-                        });
+                        *ap_cursor = ap_cursor.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        let max = self.ap_devices().len().saturating_sub(1);
-                        self.overlay = Some(Overlay::ApPicker {
-                            client_idx,
-                            ap_cursor: (ap_cursor + 1).min(max),
-                        });
+                        *ap_cursor = (*ap_cursor + 1).min(aps.len().saturating_sub(1));
                     }
                     KeyCode::Enter => {
-                        let macs = {
-                            let clients = self.sorted_clients();
-                            let aps = self.ap_devices();
-                            clients
-                                .get(client_idx)
-                                .and_then(|c| c.mac.clone())
-                                .zip(aps.get(ap_cursor).and_then(|ap| ap.mac.clone()))
-                        };
-                        if let Some((mac, ap_mac)) = macs {
-                            self.overlay = None;
-                            return InputOutcome::Spawn(PendingAction::Client(
-                                ClientAction::LockToAp { mac, ap_mac },
-                            ));
+                        let selection = aps
+                            .get(*ap_cursor)
+                            .map(|ap| (client_id.clone(), ap.mac.clone()));
+                        if let Some((client_id, ap_mac)) = selection {
+                            let mac = self.client_by_id(&client_id).and_then(|c| c.mac.clone());
+                            if let Some(mac) = mac {
+                                self.overlay = None;
+                                return InputOutcome::Spawn(PendingAction::Client(
+                                    ClientAction::LockToAp { mac, ap_mac },
+                                ));
+                            }
                         }
                     }
                     _ => {}
@@ -370,9 +472,9 @@ impl AppState {
                     return InputOutcome::Quit;
                 }
                 KeyCode::Char('k') | KeyCode::Char('b') | KeyCode::Char('a') => {
-                    if let Some(Overlay::ClientDetail(idx)) = &self.overlay {
-                        let idx = *idx;
-                        let info = self.sorted_clients().get(idx).and_then(|c| {
+                    if let Some(Overlay::ClientDetail(id)) = &self.overlay {
+                        let id = id.clone();
+                        let info = self.client_by_id(&id).and_then(|c| {
                             c.mac.clone().map(|mac| {
                                 (
                                     mac,
@@ -395,7 +497,8 @@ impl AppState {
                                         });
                                     } else {
                                         self.overlay = Some(Overlay::ApPicker {
-                                            client_idx: idx,
+                                            client_id: id,
+                                            aps: self.ap_choices(),
                                             ap_cursor: 0,
                                         });
                                     }
@@ -423,9 +526,9 @@ impl AppState {
                     }
                 }
                 KeyCode::Char('r') | KeyCode::Char('u') | KeyCode::Char('l') => {
-                    if let Some(Overlay::DeviceDetail(idx)) = &self.overlay {
-                        let idx = *idx;
-                        let info = self.devices.get(idx).and_then(|d| {
+                    if let Some(Overlay::DeviceDetail(device_mac)) = &self.overlay {
+                        let device_mac = device_mac.clone();
+                        let info = self.device_by_mac(&device_mac).and_then(|d| {
                             d.mac.clone().map(|mac| {
                                 (
                                     mac,
@@ -475,21 +578,19 @@ impl AppState {
                 return InputOutcome::Quit;
             }
             KeyCode::Enter => {
+                // The row under the cursor is resolved to an identity here,
+                // once, so everything the panel goes on to do stays aimed at
+                // the entity the user was looking at.
                 self.overlay = match self.focus {
-                    Panel::Clients => {
-                        if self.sorted_clients().is_empty() {
-                            None
-                        } else {
-                            Some(Overlay::ClientDetail(self.client_cursor))
-                        }
-                    }
-                    Panel::Devices => {
-                        if self.devices.is_empty() {
-                            None
-                        } else {
-                            Some(Overlay::DeviceDetail(self.device_scroll))
-                        }
-                    }
+                    Panel::Clients => self
+                        .sorted_clients()
+                        .get(self.client_cursor)
+                        .map(|c| Overlay::ClientDetail(c.id.clone())),
+                    Panel::Devices => self
+                        .devices
+                        .get(self.device_scroll)
+                        .and_then(|d| d.mac.as_deref())
+                        .map(|mac| Overlay::DeviceDetail(crate::api::normalize_mac(mac))),
                 };
             }
             KeyCode::Tab => {
@@ -597,19 +698,24 @@ fn device_state_str(state: Option<u32>) -> (&'static str, Color) {
     }
 }
 
+/// One refresh of the dashboard.
+///
+/// Each section is fetched separately so that a controller which stops serving
+/// one of them does not blank the rest, and each keeps its own failure rather
+/// than collapsing into an empty list: "Devices (0)" is a statement about the
+/// network, and a failed request is not entitled to make it.
+struct Snapshot {
+    sysinfo: Option<SysInfo>,
+    host_system: Option<HostSystem>,
+    health: Result<Vec<HealthSubsystem>, String>,
+    clients: Vec<LegacyClient>,
+    devices: Result<Vec<LegacyDevice>, String>,
+}
+
 async fn fetch_data_standalone(
     http: &reqwest::Client,
     base_url: &str,
-) -> Result<
-    (
-        Option<SysInfo>,
-        Option<HostSystem>,
-        Vec<HealthSubsystem>,
-        Vec<LegacyClient>,
-        Vec<LegacyDevice>,
-    ),
-    ApiError,
-> {
+) -> Result<Snapshot, ApiError> {
     let sysinfo: Option<SysInfo> = legacy_get(http, base_url, "/stat/sysinfo")
         .await
         .ok()
@@ -625,15 +731,21 @@ async fn fetch_data_standalone(
     }
     .await;
 
-    let health: Vec<HealthSubsystem> = legacy_get(http, base_url, "/stat/health")
+    let health = legacy_get(http, base_url, "/stat/health")
         .await
-        .unwrap_or_default();
+        .map_err(|e| e.to_string());
     let clients: Vec<LegacyClient> = legacy_get(http, base_url, "/stat/sta").await?;
-    let devices: Vec<LegacyDevice> = legacy_get(http, base_url, "/stat/device")
+    let devices = legacy_get(http, base_url, "/stat/device")
         .await
-        .unwrap_or_default();
+        .map_err(|e| e.to_string());
 
-    Ok((sysinfo, host_system, health, clients, devices))
+    Ok(Snapshot {
+        sysinfo,
+        host_system,
+        health,
+        clients,
+        devices,
+    })
 }
 
 async fn legacy_get<T: serde::de::DeserializeOwned>(
@@ -877,10 +989,27 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         health_spans.push(Span::raw("  "));
     }
 
+    // A health strip that could not be refreshed is labelled rather than left
+    // to read as the current state of the network: green bullets from an
+    // earlier refresh are stale, and no bullets at all is not "all quiet".
+    if state.health_error.is_some() {
+        let label = if state.health.is_empty() {
+            "health unavailable"
+        } else {
+            "health stale"
+        };
+        health_spans.push(Span::styled(label, Style::default().fg(WARN_COLOR)));
+        health_spans.push(Span::raw("  "));
+    }
+
+    // Only a reported update raises the banner. An unknown state stays silent
+    // here rather than claiming either answer: the status bar has room for a
+    // warning, not for the explanation an unknown one would need.
     if state
         .host_system
         .as_ref()
-        .is_some_and(|h| h.update_available())
+        .and_then(|h| h.update_available())
+        .unwrap_or(false)
     {
         health_spans.push(Span::styled(
             "⬆ Update available",
@@ -963,8 +1092,8 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .skip(state.client_offset)
         .take(inner_height)
         .map(|(i, c)| {
-            let total_bytes = c.tx_bytes.unwrap_or(0) + c.rx_bytes.unwrap_or(0);
-            let is_idle = total_bytes == 0;
+            let total_bytes = crate::commands::clients::total_bytes(c);
+            let is_idle = total_bytes == Some(0);
 
             let type_icon = if c.is_wired { "⌐ " } else { "◦ " };
 
@@ -994,7 +1123,7 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 Style::default()
             };
 
-            let total_style = if is_idle {
+            let total_style = if is_idle || total_bytes.is_none() {
                 Style::default().fg(DIM_COLOR)
             } else {
                 Style::default().fg(Color::White)
@@ -1024,7 +1153,8 @@ fn draw_clients(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
                 Cell::from(sig_str).style(Style::default().fg(sig_color)),
                 Cell::from(c.ip.as_deref().unwrap_or("-").to_string())
                     .style(Style::default().fg(DIM_COLOR)),
-                Cell::from(format_bytes(total_bytes)).style(total_style),
+                Cell::from(total_bytes.map(format_bytes).unwrap_or_else(|| "-".into()))
+                    .style(total_style),
             ])
             .style(row_style)
         })
@@ -1069,7 +1199,14 @@ fn draw_devices(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     } else {
         String::new()
     };
-    let title = format!(" Devices ({}){} ", state.devices.len(), dev_pos);
+    // A count is a claim, and a refresh that failed supports no claim about how
+    // many devices there are: it says "unavailable", or marks what it is still
+    // showing as left over from an earlier refresh.
+    let title = match (&state.devices_error, state.devices.is_empty()) {
+        (Some(_), true) => " Devices (unavailable) ".to_string(),
+        (Some(_), false) => format!(" Devices ({}, stale){} ", state.devices.len(), dev_pos),
+        (None, _) => format!(" Devices ({}){} ", state.devices.len(), dev_pos),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1171,12 +1308,19 @@ fn draw_devices(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     ];
 
     if state.devices.is_empty() {
-        let empty = Paragraph::new(Line::from(Span::styled(
-            "No devices found",
-            Style::default().fg(DIM_COLOR),
-        )))
-        .block(block)
-        .alignment(Alignment::Center);
+        // "No devices found" is a report about the network. Only a refresh that
+        // actually reached the controller has earned the right to make it.
+        let (text, color) = match &state.devices_error {
+            Some(err) => (
+                format!("Could not read the device list: {err}"),
+                OFFLINE_COLOR,
+            ),
+            None => ("No devices found".to_string(), DIM_COLOR),
+        };
+        let empty = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color))))
+            .block(block)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
         f.render_widget(empty, area);
     } else {
         let table = Table::new(rows, widths).header(header).block(block);
@@ -1268,11 +1412,12 @@ fn draw_overlay(f: &mut ratatui::Frame, state: &AppState) {
 
     // Handle ApPicker and Confirm separately (different layout)
     if let Overlay::ApPicker {
-        client_idx,
+        client_id,
+        aps,
         ap_cursor,
     } = overlay
     {
-        draw_ap_picker(f, state, *client_idx, *ap_cursor);
+        draw_ap_picker(f, state, client_id, aps, *ap_cursor);
         return;
     }
     if let Overlay::Confirm { message, .. } = overlay {
@@ -1282,11 +1427,13 @@ fn draw_overlay(f: &mut ratatui::Frame, state: &AppState) {
 
     // Count rows to size the overlay
     let row_count = match overlay {
-        Overlay::ClientDetail(idx) => {
-            let clients = state.sorted_clients();
-            let c = match clients.get(*idx) {
+        Overlay::ClientDetail(id) => {
+            let c = match state.client_by_id(id) {
                 Some(c) => c,
-                None => return,
+                None => {
+                    draw_departed(f, "This client is no longer connected");
+                    return;
+                }
             };
             let mut n = 3; // MAC, IP, Type
             if c.uptime.is_some() {
@@ -1312,10 +1459,13 @@ fn draw_overlay(f: &mut ratatui::Frame, state: &AppState) {
             }
             n
         }
-        Overlay::DeviceDetail(idx) => {
-            let d = match state.devices.get(*idx) {
+        Overlay::DeviceDetail(mac) => {
+            let d = match state.device_by_mac(mac) {
                 Some(d) => d,
-                None => return,
+                None => {
+                    draw_departed(f, "This device is no longer reported");
+                    return;
+                }
             };
             let mut n = 4; // Model, MAC, IP, State
             if d.version.is_some() {
@@ -1347,9 +1497,10 @@ fn draw_overlay(f: &mut ratatui::Frame, state: &AppState) {
     let hint_dim = Style::default().fg(DIM_COLOR);
 
     match overlay {
-        Overlay::ClientDetail(idx) => {
-            let clients = state.sorted_clients();
-            let Some(c) = clients.get(*idx) else { return };
+        Overlay::ClientDetail(id) => {
+            let Some(c) = state.client_by_id(id) else {
+                return;
+            };
 
             let title = format!(" {} ", c.display_name());
 
@@ -1436,8 +1587,8 @@ fn draw_overlay(f: &mut ratatui::Frame, state: &AppState) {
             let table = Table::new(rows, widths).block(block);
             f.render_widget(table, area);
         }
-        Overlay::DeviceDetail(idx) => {
-            let Some(d) = state.devices.get(*idx) else {
+        Overlay::DeviceDetail(mac) => {
+            let Some(d) = state.device_by_mac(mac) else {
                 return;
             };
 
@@ -1578,15 +1729,58 @@ fn draw_confirm(f: &mut ratatui::Frame, message: &str) {
     f.render_widget(paragraph, area);
 }
 
-fn draw_ap_picker(f: &mut ratatui::Frame, state: &AppState, client_idx: usize, ap_cursor: usize) {
-    let clients = state.sorted_clients();
-    let client = match clients.get(client_idx) {
+/// Panel shown when the client or device a detail panel was opened on has left
+/// the controller's list. Saying so is the honest answer: the alternative,
+/// falling back to whatever now occupies that row, is how an action ends up
+/// aimed at the wrong entity.
+fn draw_departed(f: &mut ratatui::Frame, message: &str) {
+    let width = (message.len() as u16 + 6).min(f.area().width.saturating_sub(4));
+    let area = centered_rect_fixed(width, 3, f.area());
+    f.render_widget(Clear, area);
+
+    let hints = vec![
+        Span::styled(
+            " esc",
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" back ", Style::default().fg(DIM_COLOR)),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(DIM_COLOR))
+        .style(Style::default().bg(Color::Black))
+        .title_bottom(Line::from(hints));
+
+    let paragraph = Paragraph::new(Line::from(Span::styled(
+        message.to_string(),
+        Style::default().fg(DIM_COLOR),
+    )))
+    .block(block)
+    .alignment(Alignment::Center);
+    f.render_widget(paragraph, area);
+}
+
+fn draw_ap_picker(
+    f: &mut ratatui::Frame,
+    state: &AppState,
+    client_id: &str,
+    aps: &[ApChoice],
+    ap_cursor: usize,
+) {
+    let client = match state.client_by_id(client_id) {
         Some(c) => c,
-        None => return,
+        None => {
+            draw_departed(f, "This client is no longer connected");
+            return;
+        }
     };
 
-    let aps = state.ap_devices();
     if aps.is_empty() {
+        draw_departed(f, "No access points to lock this client to");
         return;
     }
 
@@ -1627,33 +1821,27 @@ fn draw_ap_picker(f: &mut ratatui::Frame, state: &AppState, client_idx: usize, a
         ))
         .title_bottom(Line::from(hints));
 
-    let rows: Vec<Row> =
-        aps.iter()
-            .enumerate()
-            .map(|(i, ap)| {
-                let name = ap.name.as_deref().unwrap_or("-");
-                let mac = ap
-                    .mac
-                    .as_deref()
-                    .map(crate::api::format_mac)
-                    .unwrap_or_else(|| "-".into());
-                let is_selected = i == ap_cursor;
-                let is_current = ap.mac.as_deref().is_some_and(|m| {
-                    current_ap_mac.as_deref() == Some(&crate::api::normalize_mac(m))
-                });
-                let style = if is_selected {
-                    Style::default().bg(SELECTED_BG).fg(Color::White)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                let prefix = if is_selected { "▸ " } else { "  " };
-                let suffix = if is_current { " ◂ connected" } else { "" };
-                Row::new(vec![
-                    Cell::from(format!("{prefix}{name}{suffix}")).style(style),
-                    Cell::from(mac).style(Style::default().fg(DIM_COLOR)),
-                ])
-            })
-            .collect();
+    let rows: Vec<Row> = aps
+        .iter()
+        .enumerate()
+        .map(|(i, ap)| {
+            let name = ap.name.as_str();
+            let mac = crate::api::format_mac(&ap.mac);
+            let is_selected = i == ap_cursor;
+            let is_current = current_ap_mac.as_deref() == Some(&crate::api::normalize_mac(&ap.mac));
+            let style = if is_selected {
+                Style::default().bg(SELECTED_BG).fg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if is_selected { "▸ " } else { "  " };
+            let suffix = if is_current { " ◂ connected" } else { "" };
+            Row::new(vec![
+                Cell::from(format!("{prefix}{name}{suffix}")).style(style),
+                Cell::from(mac).style(Style::default().fg(DIM_COLOR)),
+            ])
+        })
+        .collect();
 
     let widths = [Constraint::Min(24), Constraint::Length(18)];
     let table = Table::new(rows, widths).block(block);
@@ -1687,6 +1875,20 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
         return;
     }
 
+    if state.auth_failed {
+        draw_connection_panel(
+            f,
+            " API KEY REQUIRED ",
+            "The controller rejected this API key",
+            state
+                .last_error
+                .as_deref()
+                .unwrap_or("This credential is no longer accepted."),
+            "Enter or a reopens guided configuration, then returns here.",
+        );
+        return;
+    }
+
     // Devices: 2 borders + 1 header + 1 header gap + data rows, minimum 5
     let device_rows = (state.devices.len() + 4).max(5) as u16;
     let chunks = Layout::default()
@@ -1706,23 +1908,70 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     draw_overlay(f, state);
 }
 
-type FetchResult = Result<
-    (
-        Option<SysInfo>,
-        Option<HostSystem>,
-        Vec<HealthSubsystem>,
-        Vec<LegacyClient>,
-        Vec<LegacyDevice>,
-    ),
-    String,
->;
+type FetchResult = Result<Snapshot, ApiError>;
 
-pub async fn run(api: &UnifiClient, interval_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+/// Puts the terminal into raw mode on the alternate screen, and puts it back
+/// when the TUI ends, however it ends.
+///
+/// The event loop leaves through more than one door: a `?` on a resize query,
+/// a draw, a poll or a read, and a panic anywhere inside it. Restoring only
+/// after a clean break would hand the user a shell still in raw mode on the
+/// alternate screen, with no echo, no line editing and no visible prompt, which
+/// takes a blind `reset` to undo. Drop covers every door.
+struct TerminalGuard {
+    /// How the terminal is put back. A function pointer because raw mode needs
+    /// a real terminal that no test has, while the thing worth testing is that
+    /// dropping the guard runs this at all.
+    restore: fn() -> io::Result<()>,
+}
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
+        install_panic_hook();
+        Ok(Self {
+            restore: restore_terminal,
+        })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // A failure here cannot be reported anywhere the user would see it, and
+        // an unusable terminal is worse than a lost error message.
+        let _ = (self.restore)();
+    }
+}
+
+fn restore_terminal() -> io::Result<()> {
+    disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen, Show)
+}
+
+/// Restore the terminal before a panic message is printed, so the message lands
+/// on the user's normal screen instead of the alternate one that is about to be
+/// torn down with it.
+fn install_panic_hook() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = restore_terminal();
+            previous(info);
+        }));
+    });
+}
+
+pub async fn run(
+    api: &UnifiClient,
+    interval_secs: u64,
+) -> Result<TuiExit, Box<dyn std::error::Error>> {
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = AppState::new();
@@ -1733,7 +1982,7 @@ pub async fn run(api: &UnifiClient, interval_secs: u64) -> Result<(), Box<dyn st
     let (action_tx, mut action_rx) = tokio::sync::mpsc::channel::<Result<String, String>>(4);
     let mut fetch_in_progress = false;
 
-    let result = loop {
+    loop {
         // Kick off background fetch if tick elapsed and no fetch is running
         if !fetch_in_progress && last_tick.elapsed() >= tick_rate {
             let tx = tx.clone();
@@ -1743,27 +1992,24 @@ pub async fn run(api: &UnifiClient, interval_secs: u64) -> Result<(), Box<dyn st
             state.loading = state.clients.is_empty();
             tokio::spawn(async move {
                 let result = fetch_data_standalone(&http, &base_url).await;
-                let _ = tx.send(result.map_err(|e| e.to_string())).await;
+                let _ = tx.send(result).await;
             });
         }
 
         // Check for completed fetch (non-blocking)
         if let Ok(result) = rx.try_recv() {
             fetch_in_progress = false;
-            state.loading = false;
             last_tick = Instant::now();
             match result {
-                Ok((sysinfo, host_system, health, clients, devices)) => {
-                    state.sysinfo = sysinfo;
-                    state.host_system = host_system;
-                    state.health = health;
-                    state.clients = clients;
-                    state.devices = devices;
-                    state.rebuild_device_names();
-                    state.last_error = None;
-                }
+                Ok(snapshot) => state.apply_snapshot(snapshot),
                 Err(e) => {
-                    state.last_error = Some(e);
+                    state.loading = false;
+                    state.auth_failed = matches!(e, ApiError::Auth(_));
+                    state.last_error = Some(if state.auth_failed {
+                        "Create or replace the key in UniFi Network → Integrations.".into()
+                    } else {
+                        e.to_string()
+                    });
                 }
             }
         }
@@ -1777,6 +2023,7 @@ pub async fn run(api: &UnifiClient, interval_secs: u64) -> Result<(), Box<dyn st
                     last_tick = Instant::now() - tick_rate;
                 }
                 Err(msg) => {
+                    state.auth_failed = authentication_message(&msg);
                     state.last_error = Some(msg);
                 }
             }
@@ -1813,7 +2060,8 @@ pub async fn run(api: &UnifiClient, interval_secs: u64) -> Result<(), Box<dyn st
 
             match state.handle_key(key) {
                 InputOutcome::Continue => {}
-                InputOutcome::Quit => break Ok(()),
+                InputOutcome::Quit => return Ok(TuiExit::Quit),
+                InputOutcome::Configure => return Ok(TuiExit::Configure),
                 InputOutcome::Spawn(action) => {
                     let http = api.clone_http();
                     let base_url = api.base_url().to_string();
@@ -1835,19 +2083,134 @@ pub async fn run(api: &UnifiClient, interval_secs: u64) -> Result<(), Box<dyn st
                 }
             }
         }
-    };
+    }
+}
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+fn authentication_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("authentication")
+        || lower.contains("unauthorized")
+        || lower.contains("api error (401)")
+        || lower.contains("api error (403)")
+}
 
-    result
+pub fn request_configuration(
+    profile: Option<&str>,
+    host: Option<&str>,
+    reason: &str,
+) -> Result<TuiExit, Box<dyn std::error::Error>> {
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+    loop {
+        terminal.draw(|frame| {
+            let target = match (profile, host) {
+                (Some(profile), Some(host)) => format!("Profile {profile} · {host}"),
+                (Some(profile), None) => format!("Profile {profile}"),
+                (None, Some(host)) => host.to_string(),
+                (None, None) => "Default profile".into(),
+            };
+            draw_connection_panel(
+                frame,
+                " CONNECT UNIFI ",
+                "Connect your controller",
+                reason,
+                &format!("{target}. Enter or a starts guided setup."),
+            );
+        })?;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('a') => return Ok(TuiExit::Configure),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(TuiExit::Quit),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(TuiExit::Quit);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn draw_connection_panel(
+    frame: &mut ratatui::Frame,
+    title: &str,
+    heading: &str,
+    reason: &str,
+    next_step: &str,
+) {
+    let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Reset)),
+        area,
+    );
+    let width = area.width.saturating_sub(2).clamp(1, 82);
+    let height = area.height.saturating_sub(2).clamp(1, 13);
+    let panel = centered_rect_fixed(width, height, area);
+    let key_style = Style::default()
+        .fg(ACCENT_COLOR)
+        .add_modifier(Modifier::BOLD);
+    let lines = vec![
+        Line::styled(
+            heading,
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(""),
+        Line::styled(reason, Style::default()),
+        Line::styled(next_step, Style::default().fg(DIM_COLOR)),
+        Line::raw(""),
+        Line::styled(
+            "Create API keys in UniFi Network → Integrations",
+            Style::default(),
+        ),
+        Line::styled(API_HELP_URL, Style::default().fg(DIM_COLOR)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("enter / a", key_style),
+            Span::styled(" configure   ", Style::default().fg(DIM_COLOR)),
+            Span::styled("q", key_style),
+            Span::styled(" quit", Style::default().fg(DIM_COLOR)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(ACCENT_COLOR))
+                    .padding(ratatui::widgets::Padding::horizontal(2)),
+            ),
+        panel,
+    );
 }
 
 // --- Ports Live TUI ---
 
 use crate::api::{DeviceWithPorts, PortEntry};
+
+/// How long a throughput measurement is allowed to stand while the reported
+/// counters sit still.
+///
+/// Unchanged counters have two causes that look identical from here: the
+/// controller has not published a new sample yet, or the port has gone quiet.
+/// Holding the last measurement covers the first, which is the common one,
+/// since the controller resamples device statistics only about once a minute.
+/// It cannot cover the second indefinitely, or a port that stopped carrying
+/// traffic would keep advertising the rate it had when it stopped. Past this
+/// bound the measurement no longer describes the present under either reading,
+/// so the rate becomes unknown rather than stale: still being quietly wrong
+/// about which of the two happened is not worth a confident number.
+const RATE_MAX_AGE: Duration = Duration::from_secs(180);
 
 struct PortsState {
     device: Option<DeviceWithPorts>,
@@ -1882,29 +2245,85 @@ impl PortsState {
                 Some(i) => i,
                 None => continue,
             };
-            let tx = port.tx_bytes.unwrap_or(0);
-            let rx = port.rx_bytes.unwrap_or(0);
-
-            if let Some((prev_tx, prev_rx, prev_time)) = self.prev_bytes.get(&idx) {
-                let elapsed = now.duration_since(*prev_time).as_secs_f64();
-                if elapsed > 0.1 {
-                    let tx_rate = if tx >= *prev_tx {
-                        (tx - prev_tx) as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-                    let rx_rate = if rx >= *prev_rx {
-                        (rx - prev_rx) as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-                    self.port_rates.insert(idx, (tx_rate, rx_rate));
+            // A counter the device did not report is not a counter of zero.
+            // Storing it as a baseline would make the next poll, when the real
+            // counter arrives, look like gigabytes moved in one interval, so a
+            // port missing either counter is dropped from the rate table and
+            // renders as unknown until it reports again.
+            let (tx, rx) = match (port.tx_bytes, port.rx_bytes) {
+                (Some(tx), Some(rx)) => (tx, rx),
+                _ => {
+                    self.prev_bytes.remove(&idx);
+                    self.port_rates.remove(&idx);
+                    continue;
                 }
+            };
+
+            // A severed link carries nothing, and its counters are frozen at
+            // the value they reached while it was up. Holding the rate that was
+            // measured then would leave a down port reporting throughput for as
+            // long as it stays down, so it is dropped and the baseline moves
+            // with each poll: the first measurement after the link returns then
+            // spans only the time it has been up.
+            if !port.up {
+                self.port_rates.remove(&idx);
+                self.prev_bytes.insert(idx, (tx, rx, now));
+                continue;
             }
 
+            let Some(&(prev_tx, prev_rx, prev_time)) = self.prev_bytes.get(&idx) else {
+                self.prev_bytes.insert(idx, (tx, rx, now));
+                continue;
+            };
+
+            // The controller refreshes device statistics far more slowly than
+            // this view refreshes, so most polls hand back the counters the
+            // previous poll already saw. That is not a measurement of an idle
+            // port, it is the absence of a new measurement: dividing it by the
+            // poll interval would show 0 B/s on a port moving hundreds of
+            // kilobytes a second. The window stays open until the counters
+            // move, and the last real measurement stands in the meantime, but
+            // only for as long as it can still be said to describe the present.
+            if tx == prev_tx && rx == prev_rx {
+                if now.duration_since(prev_time) > RATE_MAX_AGE {
+                    self.port_rates.remove(&idx);
+                }
+                continue;
+            }
+
+            // Counters that went backwards mean the device restarted. No rate
+            // spans that boundary, and subtracting across it would wrap the
+            // unsigned delta into an enormous fabricated burst.
+            if tx < prev_tx || rx < prev_rx {
+                self.port_rates.remove(&idx);
+                self.prev_bytes.insert(idx, (tx, rx, now));
+                continue;
+            }
+
+            let elapsed = now.duration_since(prev_time).as_secs_f64();
+            if elapsed > 0.0 {
+                self.port_rates.insert(
+                    idx,
+                    (
+                        (tx - prev_tx) as f64 / elapsed,
+                        (rx - prev_rx) as f64 / elapsed,
+                    ),
+                );
+            }
             self.prev_bytes.insert(idx, (tx, rx, now));
         }
     }
+}
+
+/// A throughput cell. No rate yet, or a port whose counters the device does not
+/// report, renders as unknown: "0 B/s" would claim the port is idle.
+fn rate_cell(rate: Option<f64>) -> Cell<'static> {
+    let color = match rate {
+        Some(r) if r >= 1024.0 => Color::Green,
+        _ => DIM_COLOR,
+    };
+    Cell::from(rate.map(format_rate).unwrap_or_else(|| "-".into()))
+        .style(Style::default().fg(color))
 }
 
 fn port_link_color(port: &PortEntry) -> Color {
@@ -2012,9 +2431,12 @@ fn draw_ports(f: &mut ratatui::Frame, state: &PortsState) {
         .skip(state.scroll)
         .take(inner_height)
         .map(|p| {
-            let idx = p.port_idx.unwrap_or(0);
             let link_color = port_link_color(p);
-            let (tx_rate, rx_rate) = state.port_rates.get(&idx).copied().unwrap_or((0.0, 0.0));
+            // Rates are keyed by port index. A port that reported no index
+            // cannot be matched to a sample, and must not be shown port 0's.
+            let rates = p
+                .port_idx
+                .and_then(|idx| state.port_rates.get(&idx).copied());
 
             let link_str = if p.up { "\u{25cf} up" } else { "\u{25cb} down" };
 
@@ -2048,7 +2470,12 @@ fn draw_ports(f: &mut ratatui::Frame, state: &PortsState) {
             };
 
             Row::new(vec![
-                Cell::from(idx.to_string()).style(
+                Cell::from(
+                    p.port_idx
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                )
+                .style(
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
@@ -2058,16 +2485,8 @@ fn draw_ports(f: &mut ratatui::Frame, state: &PortsState) {
                 Cell::from(link_str).style(Style::default().fg(link_color)),
                 Cell::from(speed_str).style(Style::default().fg(link_color)),
                 Cell::from(poe_str).style(Style::default().fg(poe_color)),
-                Cell::from(format_rate(tx_rate)).style(Style::default().fg(if tx_rate >= 1024.0 {
-                    Color::Green
-                } else {
-                    DIM_COLOR
-                })),
-                Cell::from(format_rate(rx_rate)).style(Style::default().fg(if rx_rate >= 1024.0 {
-                    Color::Green
-                } else {
-                    DIM_COLOR
-                })),
+                rate_cell(rates.map(|(tx, _)| tx)),
+                rate_cell(rates.map(|(_, rx)| rx)),
                 Cell::from(p.tx_bytes.map(format_bytes).unwrap_or_else(|| "-".into()))
                     .style(Style::default().fg(DIM_COLOR)),
                 Cell::from(p.rx_bytes.map(format_bytes).unwrap_or_else(|| "-".into()))
@@ -2144,17 +2563,15 @@ pub async fn run_ports(
     mac: &str,
     interval_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let _terminal_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = PortsState::new(interval_secs);
     let tick_rate = Duration::from_secs(interval_secs);
     let mut last_tick = Instant::now() - tick_rate;
 
-    let result = loop {
+    loop {
         if last_tick.elapsed() >= tick_rate {
             match api.get_device_ports(mac).await {
                 Ok(device) => {
@@ -2179,8 +2596,10 @@ pub async fn run_ports(
             }
 
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break Ok(()),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break Ok(()),
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.scroll = state.scroll.saturating_sub(1);
                 }
@@ -2197,13 +2616,7 @@ pub async fn run_ports(
                 _ => {}
             }
         }
-    };
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    result
+    }
 }
 
 #[cfg(test)]
@@ -2237,11 +2650,11 @@ mod tests {
 
     #[test]
     fn ip_sort_key_ordering() {
-        let mut ips = vec!["10.0.0.2", "10.0.0.10", "10.0.0.1", "192.168.1.1"];
+        let mut ips = vec!["192.0.2.2", "192.0.2.10", "192.0.2.1", "198.51.100.1"];
         ips.sort_by_key(|ip| ip_sort_key(ip));
         assert_eq!(
             ips,
-            vec!["10.0.0.1", "10.0.0.2", "10.0.0.10", "192.168.1.1"]
+            vec!["192.0.2.1", "192.0.2.2", "192.0.2.10", "198.51.100.1"]
         );
     }
 
@@ -2427,20 +2840,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_client_detail() {
-        let mut state = AppState::new();
-        state.overlay = Some(Overlay::ClientDetail(5));
-        assert!(matches!(state.overlay, Some(Overlay::ClientDetail(5))));
-    }
-
-    #[test]
-    fn overlay_device_detail() {
-        let mut state = AppState::new();
-        state.overlay = Some(Overlay::DeviceDetail(2));
-        assert!(matches!(state.overlay, Some(Overlay::DeviceDetail(2))));
-    }
-
-    #[test]
     fn overlay_confirm() {
         let mut state = AppState::new();
         state.overlay = Some(Overlay::Confirm {
@@ -2450,14 +2849,29 @@ mod tests {
         assert!(matches!(state.overlay, Some(Overlay::Confirm { .. })));
     }
 
+    /// Opening a panel resolves the highlighted row to an identity once. Every
+    /// later lookup goes through that identity, which is what keeps the panel
+    /// on its entity when a refresh reorders the list underneath it.
     #[test]
-    fn overlay_ap_picker() {
-        let mut state = AppState::new();
-        state.overlay = Some(Overlay::ApPicker {
-            client_idx: 3,
-            ap_cursor: 0,
-        });
-        assert!(matches!(state.overlay, Some(Overlay::ApPicker { .. })));
+    fn opening_a_panel_records_which_entity_it_is_for() {
+        let mut state = dashboard();
+        state.client_cursor = 1; // Phone
+        state.handle_key(press(KeyCode::Enter));
+        match &state.overlay {
+            Some(Overlay::ClientDetail(id)) => assert_eq!(id, "2", "Phone's _id"),
+            _ => panic!("expected a client detail overlay"),
+        }
+        state.handle_key(press(KeyCode::Esc));
+
+        state.focus = Panel::Devices;
+        state.device_scroll = 1; // Switch-01
+        state.handle_key(press(KeyCode::Enter));
+        match &state.overlay {
+            Some(Overlay::DeviceDetail(mac)) => {
+                assert_eq!(mac, &crate::api::normalize_mac("dd:ee:ff:00:00:02"));
+            }
+            _ => panic!("expected a device detail overlay"),
+        }
     }
 
     // --- Device name resolution ---
@@ -2502,9 +2916,9 @@ mod tests {
     fn sorted_clients_bandwidth_default() {
         let mut state = AppState::new();
         state.clients = vec![
-            make_client("1", "Low", "10.0.0.1", 100, 100),
-            make_client("2", "High", "10.0.0.2", 10000, 10000),
-            make_client("3", "Mid", "10.0.0.3", 1000, 1000),
+            make_client("1", "Low", "192.0.2.1", 100, 100),
+            make_client("2", "High", "192.0.2.2", 10000, 10000),
+            make_client("3", "Mid", "192.0.2.3", 1000, 1000),
         ];
         let sorted = state.sorted_clients();
         assert_eq!(sorted[0].display_name(), "High");
@@ -2517,9 +2931,9 @@ mod tests {
         let mut state = AppState::new();
         state.sort = SortMode::Name;
         state.clients = vec![
-            make_client("1", "Charlie", "10.0.0.1", 0, 0),
-            make_client("2", "Alice", "10.0.0.2", 0, 0),
-            make_client("3", "Bob", "10.0.0.3", 0, 0),
+            make_client("1", "Charlie", "192.0.2.1", 0, 0),
+            make_client("2", "Alice", "192.0.2.2", 0, 0),
+            make_client("3", "Bob", "192.0.2.3", 0, 0),
         ];
         let sorted = state.sorted_clients();
         assert_eq!(sorted[0].display_name(), "Alice");
@@ -2532,14 +2946,14 @@ mod tests {
         let mut state = AppState::new();
         state.sort = SortMode::Ip;
         state.clients = vec![
-            make_client("1", "A", "10.0.0.10", 0, 0),
-            make_client("2", "B", "10.0.0.2", 0, 0),
-            make_client("3", "C", "10.0.0.1", 0, 0),
+            make_client("1", "A", "192.0.2.10", 0, 0),
+            make_client("2", "B", "192.0.2.2", 0, 0),
+            make_client("3", "C", "192.0.2.1", 0, 0),
         ];
         let sorted = state.sorted_clients();
-        assert_eq!(sorted[0].display_name(), "C"); // 10.0.0.1
-        assert_eq!(sorted[1].display_name(), "B"); // 10.0.0.2
-        assert_eq!(sorted[2].display_name(), "A"); // 10.0.0.10
+        assert_eq!(sorted[0].display_name(), "C"); // 192.0.2.1
+        assert_eq!(sorted[1].display_name(), "B"); // 192.0.2.2
+        assert_eq!(sorted[2].display_name(), "A"); // 192.0.2.10
     }
 
     #[test]
@@ -2547,8 +2961,8 @@ mod tests {
         let mut state = AppState::new();
         state.filter = "ali".to_string();
         state.clients = vec![
-            make_client("1", "Alice", "10.0.0.1", 0, 0),
-            make_client("2", "Bob", "10.0.0.2", 0, 0),
+            make_client("1", "Alice", "192.0.2.1", 0, 0),
+            make_client("2", "Bob", "192.0.2.2", 0, 0),
         ];
         let sorted = state.sorted_clients();
         assert_eq!(sorted.len(), 1);
@@ -2558,10 +2972,10 @@ mod tests {
     #[test]
     fn sorted_clients_filter_by_ip() {
         let mut state = AppState::new();
-        state.filter = "10.0.0.2".to_string();
+        state.filter = "192.0.2.2".to_string();
         state.clients = vec![
-            make_client("1", "Alice", "10.0.0.1", 0, 0),
-            make_client("2", "Bob", "10.0.0.2", 0, 0),
+            make_client("1", "Alice", "192.0.2.1", 0, 0),
+            make_client("2", "Bob", "192.0.2.2", 0, 0),
         ];
         let sorted = state.sorted_clients();
         assert_eq!(sorted.len(), 1);
@@ -2588,8 +3002,8 @@ mod tests {
         let mut state = AppState::new();
         state.filter = String::new();
         state.clients = vec![
-            make_client("1", "A", "10.0.0.1", 0, 0),
-            make_client("2", "B", "10.0.0.2", 0, 0),
+            make_client("1", "A", "192.0.2.1", 0, 0),
+            make_client("2", "B", "192.0.2.2", 0, 0),
         ];
         assert_eq!(state.sorted_clients().len(), 2);
     }
@@ -2711,6 +3125,35 @@ mod tests {
     }
 
     #[test]
+    fn authentication_failure_has_an_in_place_configuration_action() {
+        let mut state = AppState::new();
+        state.loading = false;
+        state.auth_failed = true;
+        state.last_error =
+            Some("Create or replace the key in UniFi Network → Integrations.".into());
+        let text = render(&state, 100, 26);
+        assert!(text.contains("API KEY REQUIRED"), "{text}");
+        assert!(text.contains("enter / a"), "{text}");
+        assert!(text.contains("configure"), "{text}");
+        assert!(text.contains("help.ui.com"), "{text}");
+        assert!(matches!(
+            state.handle_key(press(KeyCode::Enter)),
+            InputOutcome::Configure
+        ));
+        assert!(matches!(
+            state.handle_key(press(KeyCode::Char('a'))),
+            InputOutcome::Configure
+        ));
+    }
+
+    #[test]
+    fn authentication_message_does_not_confuse_network_failures_with_bad_keys() {
+        assert!(authentication_message("API error (401): Unauthorized"));
+        assert!(authentication_message("Authentication error: invalid key"));
+        assert!(!authentication_message("Connection timed out"));
+    }
+
+    #[test]
     fn render_dashboard_shows_clients_and_devices() {
         let text = render(&dashboard(), 120, 30);
         assert!(text.contains("Clients (3)"), "{text}");
@@ -2737,16 +3180,26 @@ mod tests {
         state
             .devices
             .push(make_device("dd:ee:ff:00:00:03", "AP-Garage", "uap"));
+        let aps = state.ap_choices();
         for overlay in [
-            Overlay::ClientDetail(0),
-            Overlay::DeviceDetail(0),
+            Overlay::ClientDetail("1".into()),
+            Overlay::DeviceDetail(crate::api::normalize_mac("dd:ee:ff:00:00:01")),
             Overlay::ApPicker {
-                client_idx: 0,
+                client_id: "1".into(),
+                aps,
                 ap_cursor: 1,
             },
             Overlay::Confirm {
                 message: "Restart AP-Office?".into(),
                 action: PendingAction::Device(DeviceAction::Restart("dd:ee:ff:00:00:01".into())),
+            },
+            // Panels whose entity left between opening and drawing.
+            Overlay::ClientDetail("gone".into()),
+            Overlay::DeviceDetail("ffffffffffff".into()),
+            Overlay::ApPicker {
+                client_id: "gone".into(),
+                aps: Vec::new(),
+                ap_cursor: 0,
             },
         ] {
             state.overlay = Some(overlay);
@@ -2837,7 +3290,7 @@ mod tests {
         let mut state = dashboard();
         state.client_cursor = 1;
         state.handle_key(press(KeyCode::Enter));
-        assert!(matches!(state.overlay, Some(Overlay::ClientDetail(1))));
+        assert!(matches!(state.overlay, Some(Overlay::ClientDetail(_))));
         state.handle_key(press(KeyCode::Esc));
         assert!(state.overlay.is_none());
     }
@@ -2848,7 +3301,8 @@ mod tests {
         state.focus = Panel::Devices;
         state.device_scroll = 1;
         state.handle_key(press(KeyCode::Enter));
-        assert!(matches!(state.overlay, Some(Overlay::DeviceDetail(1))));
+        let text = render(&state, 120, 30);
+        assert!(text.contains("Switch-01"), "{text}");
     }
 
     #[test]
@@ -2862,7 +3316,8 @@ mod tests {
     #[test]
     fn client_detail_kick_opens_confirm() {
         let mut state = dashboard();
-        state.overlay = Some(Overlay::ClientDetail(0)); // Laptop
+        state.client_cursor = 0; // Laptop
+        state.handle_key(press(KeyCode::Enter));
         let outcome = state.handle_key(press(KeyCode::Char('k')));
         assert!(matches!(outcome, InputOutcome::Continue));
         match &state.overlay {
@@ -2880,7 +3335,8 @@ mod tests {
     #[test]
     fn client_detail_block_opens_confirm() {
         let mut state = dashboard();
-        state.overlay = Some(Overlay::ClientDetail(1)); // Phone, not blocked
+        state.client_cursor = 1; // Phone, not blocked
+        state.handle_key(press(KeyCode::Enter));
         state.handle_key(press(KeyCode::Char('b')));
         match &state.overlay {
             Some(Overlay::Confirm { message, action }) => {
@@ -2924,7 +3380,9 @@ mod tests {
     #[test]
     fn device_detail_restart_opens_confirm() {
         let mut state = dashboard();
-        state.overlay = Some(Overlay::DeviceDetail(0)); // AP-Office
+        state.focus = Panel::Devices;
+        state.device_scroll = 0; // AP-Office
+        state.handle_key(press(KeyCode::Enter));
         state.handle_key(press(KeyCode::Char('r')));
         match &state.overlay {
             Some(Overlay::Confirm { message, action }) => {
@@ -2941,14 +3399,16 @@ mod tests {
     #[test]
     fn device_detail_locate_spawns_and_toggles_locating() {
         let mut state = dashboard();
-        state.overlay = Some(Overlay::DeviceDetail(0));
+        state.focus = Panel::Devices;
+        state.device_scroll = 0; // AP-Office
+        state.handle_key(press(KeyCode::Enter));
         let outcome = state.handle_key(press(KeyCode::Char('l')));
         assert!(matches!(
             outcome,
             InputOutcome::Spawn(PendingAction::Device(DeviceAction::Locate(_, true)))
         ));
         // Locate leaves the detail overlay open and records the new state.
-        assert!(matches!(state.overlay, Some(Overlay::DeviceDetail(0))));
+        assert!(matches!(state.overlay, Some(Overlay::DeviceDetail(_))));
         let norm = crate::api::normalize_mac("dd:ee:ff:00:00:01");
         assert_eq!(state.locating.get(&norm), Some(&true));
     }
@@ -2959,10 +3419,9 @@ mod tests {
         state
             .devices
             .push(make_device("dd:ee:ff:00:00:03", "AP-Garage", "uap"));
-        state.overlay = Some(Overlay::ApPicker {
-            client_idx: 0,
-            ap_cursor: 0,
-        });
+        state.client_cursor = 0; // Laptop, wireless and not yet locked
+        state.handle_key(press(KeyCode::Enter));
+        state.handle_key(press(KeyCode::Char('a')));
         state.handle_key(press(KeyCode::Down));
         assert!(matches!(
             state.overlay,
@@ -2979,11 +3438,792 @@ mod tests {
     #[test]
     fn ap_picker_esc_returns_to_client_detail() {
         let mut state = dashboard();
-        state.overlay = Some(Overlay::ApPicker {
-            client_idx: 2,
-            ap_cursor: 0,
-        });
+        state.client_cursor = 2; // Tablet
+        state.handle_key(press(KeyCode::Enter));
+        state.handle_key(press(KeyCode::Char('a')));
         state.handle_key(press(KeyCode::Esc));
-        assert!(matches!(state.overlay, Some(Overlay::ClientDetail(2))));
+        let text = render(&state, 120, 30);
+        assert!(text.contains("Tablet"), "{text}");
+        assert!(!text.contains("Lock Tablet to AP"), "{text}");
+    }
+
+    // --- An overlay outliving the refresh that reorders the list beneath it ---
+    //
+    // The client list is sorted by live byte counters and the device list
+    // arrives in whatever order the controller sends, so both are reshuffled by
+    // every background refresh while a detail panel sits open on top of them.
+    // An overlay that remembered only a row position would therefore aim its
+    // kick, block, AP lock, restart or locate at whichever entity had moved
+    // into that row. These press the real keys rather than building overlays
+    // directly, so they describe what a user does and survive a change of
+    // representation.
+
+    /// The same three clients as `dashboard()`, but Phone has become the top
+    /// talker, which is enough to put it in the row Laptop occupied.
+    fn refreshed_with_phone_on_top() -> Vec<LegacyClient> {
+        vec![
+            client_with_mac("2", "Phone", "aa:bb:cc:00:00:02", 99_999),
+            client_with_mac("1", "Laptop", "aa:bb:cc:00:00:01", 10_000),
+            client_with_mac("3", "Tablet", "aa:bb:cc:00:00:03", 100),
+        ]
+    }
+
+    fn confirm_message(state: &AppState) -> String {
+        match &state.overlay {
+            Some(Overlay::Confirm { message, .. }) => message.clone(),
+            _ => panic!("expected a confirm overlay"),
+        }
+    }
+
+    #[test]
+    fn client_detail_action_follows_the_client_not_the_row() {
+        let mut state = dashboard();
+        state.client_cursor = 0; // Laptop, the top talker
+        state.handle_key(press(KeyCode::Enter));
+
+        state.clients = refreshed_with_phone_on_top();
+
+        state.handle_key(press(KeyCode::Char('k')));
+        assert_eq!(confirm_message(&state), "Kick Laptop?");
+        match &state.overlay {
+            Some(Overlay::Confirm {
+                action: PendingAction::Client(ClientAction::Kick(mac)),
+                ..
+            }) => assert_eq!(mac, "aa:bb:cc:00:00:01", "Laptop's MAC"),
+            _ => panic!("expected a kick action"),
+        }
+    }
+
+    #[test]
+    fn client_detail_action_follows_the_client_when_the_list_shrinks() {
+        let mut state = dashboard();
+        state.client_cursor = 2; // Tablet, the bottom row
+        state.handle_key(press(KeyCode::Enter));
+
+        // Laptop disconnects: Tablet is still listed, one row higher.
+        state.clients.retain(|c| c.display_name() != "Laptop");
+
+        state.handle_key(press(KeyCode::Char('b')));
+        assert_eq!(confirm_message(&state), "Block Tablet?");
+    }
+
+    #[test]
+    fn device_detail_locate_follows_the_device_not_the_row() {
+        let mut state = dashboard();
+        state.focus = Panel::Devices;
+        state.device_scroll = 1; // Switch-01
+        state.handle_key(press(KeyCode::Enter));
+
+        // A refresh reports a newly adopted AP first, shifting every row down.
+        state.devices = vec![
+            make_device("dd:ee:ff:00:00:03", "AP-Garage", "uap"),
+            make_device("dd:ee:ff:00:00:01", "AP-Office", "uap"),
+            make_device("dd:ee:ff:00:00:02", "Switch-01", "usw"),
+        ];
+
+        // Locate fires immediately, with no confirmation to catch a wrong target.
+        match state.handle_key(press(KeyCode::Char('l'))) {
+            InputOutcome::Spawn(PendingAction::Device(DeviceAction::Locate(mac, true))) => {
+                assert_eq!(mac, "dd:ee:ff:00:00:02", "Switch-01's MAC");
+            }
+            _ => panic!("expected a locate action"),
+        }
+    }
+
+    #[test]
+    fn device_detail_restart_follows_the_device_not_the_row() {
+        let mut state = dashboard();
+        state.focus = Panel::Devices;
+        state.device_scroll = 1; // Switch-01
+        state.handle_key(press(KeyCode::Enter));
+
+        state.devices = vec![
+            make_device("dd:ee:ff:00:00:03", "AP-Garage", "uap"),
+            make_device("dd:ee:ff:00:00:01", "AP-Office", "uap"),
+            make_device("dd:ee:ff:00:00:02", "Switch-01", "usw"),
+        ];
+
+        state.handle_key(press(KeyCode::Char('r')));
+        assert_eq!(confirm_message(&state), "Restart Switch-01?");
+    }
+
+    #[test]
+    fn ap_picker_locks_the_client_it_was_opened_on() {
+        let mut state = dashboard();
+        state.client_cursor = 0; // Laptop
+        state.handle_key(press(KeyCode::Enter));
+        state.handle_key(press(KeyCode::Char('a')));
+
+        state.clients = refreshed_with_phone_on_top();
+
+        match state.handle_key(press(KeyCode::Enter)) {
+            InputOutcome::Spawn(PendingAction::Client(ClientAction::LockToAp { mac, .. })) => {
+                assert_eq!(mac, "aa:bb:cc:00:00:01", "Laptop's MAC");
+            }
+            outcome => {
+                let _ = outcome;
+                panic!("expected a lock-to-AP action");
+            }
+        }
+    }
+
+    #[test]
+    fn ap_picker_locks_the_ap_that_was_highlighted() {
+        let mut state = dashboard();
+        state
+            .devices
+            .push(make_device("dd:ee:ff:00:00:03", "AP-Garage", "uap"));
+        state.client_cursor = 0;
+        state.handle_key(press(KeyCode::Enter));
+        state.handle_key(press(KeyCode::Char('a')));
+        state.handle_key(press(KeyCode::Down)); // highlight AP-Garage, the second AP
+
+        // A refresh puts a third AP between them.
+        state.devices = vec![
+            make_device("dd:ee:ff:00:00:01", "AP-Office", "uap"),
+            make_device("dd:ee:ff:00:00:04", "AP-Shed", "uap"),
+            make_device("dd:ee:ff:00:00:03", "AP-Garage", "uap"),
+        ];
+
+        match state.handle_key(press(KeyCode::Enter)) {
+            InputOutcome::Spawn(PendingAction::Client(ClientAction::LockToAp {
+                ap_mac, ..
+            })) => {
+                assert_eq!(ap_mac, "dd:ee:ff:00:00:03", "AP-Garage's MAC");
+            }
+            _ => panic!("expected a lock-to-AP action"),
+        }
+    }
+
+    #[test]
+    fn detail_overlay_reports_a_client_that_left() {
+        let mut state = dashboard();
+        state.client_cursor = 0; // Laptop
+        state.handle_key(press(KeyCode::Enter));
+
+        state.clients.retain(|c| c.display_name() != "Laptop");
+
+        let text = render(&state, 120, 30);
+        assert!(
+            text.contains("no longer connected"),
+            "the overlay must say the client is gone rather than silently \
+             showing whoever took its place:\n{text}"
+        );
+        assert!(matches!(
+            state.handle_key(press(KeyCode::Char('k'))),
+            InputOutcome::Continue
+        ));
+        assert!(
+            !matches!(state.overlay, Some(Overlay::Confirm { .. })),
+            "a departed client cannot be kicked"
+        );
+    }
+
+    // --- Counters the controller did not report ---
+
+    #[test]
+    fn a_client_with_no_counters_is_not_shown_as_idle() {
+        let mut state = AppState::new();
+        state.loading = false;
+        state.clients = vec![
+            serde_json::from_str(r#"{"_id":"1","name":"Ghost","mac":"aa:bb:cc:00:00:09"}"#)
+                .unwrap(),
+        ];
+        let text = render(&state, 120, 30);
+        assert!(text.contains("Ghost"), "{text}");
+        assert!(
+            !text.contains("0 B"),
+            "a client whose traffic the controller did not report must not be \
+             shown as having moved zero bytes:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_client_with_both_counters_still_shows_a_total() {
+        let text = render(&dashboard(), 120, 30);
+        assert!(text.contains("9.8 KB"), "Laptop's 10,000 bytes:\n{text}");
+    }
+
+    fn ports_device(port_json: &str) -> DeviceWithPorts {
+        serde_json::from_str(&format!(
+            r#"{{"mac":"dd:ee:ff:00:00:02","name":"Switch-01","port_table":[{port_json}]}}"#
+        ))
+        .unwrap()
+    }
+
+    /// Backdate every recorded baseline so the next sample spans a real
+    /// interval, without the test having to sleep through one.
+    ///
+    /// The window is long relative to any interval the tests care about,
+    /// because the clock keeps running between the two samples: a rate asserted
+    /// over a two-second window moves by a percent when the machine is loaded,
+    /// which is a statement about the test host rather than about the code.
+    fn age_baselines(state: &mut PortsState, by: Duration) {
+        for entry in state.prev_bytes.values_mut() {
+            entry.2 -= by;
+        }
+    }
+
+    /// The interval every rate test measures over, and the byte delta that
+    /// makes 1000 B/s across it.
+    const WINDOW: Duration = Duration::from_secs(100);
+    const WINDOW_DELTA: u64 = 100_000;
+
+    #[test]
+    fn a_port_with_no_counters_gets_no_baseline() {
+        let mut state = PortsState::new(2);
+        state.device = Some(ports_device(r#"{"port_idx":1,"up":true}"#));
+        state.update_port_rates();
+        assert!(
+            state.prev_bytes.is_empty(),
+            "an unreported counter must not be recorded as zero bytes"
+        );
+    }
+
+    #[test]
+    fn a_counter_appearing_later_does_not_read_as_a_burst() {
+        let mut state = PortsState::new(2);
+
+        // First poll: the device reports the port but not its counters.
+        state.device = Some(ports_device(r#"{"port_idx":1,"up":true}"#));
+        state.update_port_rates();
+        age_baselines(&mut state, Duration::from_secs(2));
+
+        // Second poll: the counters arrive, carrying the port's whole history.
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"up":true,"tx_bytes":5000000000,"rx_bytes":4000000000}"#,
+        ));
+        state.update_port_rates();
+
+        assert_eq!(
+            state.port_rates.get(&1),
+            None,
+            "the first real reading is a baseline, not five gigabytes of traffic"
+        );
+    }
+
+    #[test]
+    fn a_port_that_stops_reporting_counters_drops_its_baseline() {
+        let mut state = PortsState::new(2);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"up":true,"tx_bytes":1000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+        assert!(state.prev_bytes.contains_key(&1));
+
+        state.device = Some(ports_device(r#"{"port_idx":1,"up":true}"#));
+        state.update_port_rates();
+        assert!(
+            state.prev_bytes.is_empty(),
+            "a stale baseline would turn the next reading into a fabricated burst"
+        );
+    }
+
+    #[test]
+    fn port_rates_are_computed_from_two_real_readings() {
+        let mut state = PortsState::new(2);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"up":true,"tx_bytes":1000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+        age_baselines(&mut state, WINDOW);
+
+        state.device = Some(ports_device(&format!(
+            r#"{{"port_idx":1,"up":true,"tx_bytes":{},"rx_bytes":2000}}"#,
+            1000 + WINDOW_DELTA
+        )));
+        state.update_port_rates();
+
+        let (tx_rate, rx_rate) = state.port_rates.get(&1).copied().expect("a rate");
+        assert!(
+            (tx_rate - 1000.0).abs() < 10.0,
+            "{WINDOW_DELTA} bytes over {} seconds, got {tx_rate}",
+            WINDOW.as_secs()
+        );
+        assert_eq!(
+            rx_rate, 0.0,
+            "the controller published a new sample and rx did not move in it"
+        );
+    }
+
+    #[test]
+    fn repeated_identical_counters_are_not_a_measurement_of_an_idle_port() {
+        let mut state = PortsState::new(2);
+        let busy = r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":1000,"rx_bytes":2000}"#;
+
+        state.device = Some(ports_device(busy));
+        state.update_port_rates();
+        // The controller republishes the same counters for many polls: it
+        // updates device statistics on the order of a minute, while this view
+        // polls every couple of seconds.
+        for _ in 0..10 {
+            age_baselines(&mut state, WINDOW / 10);
+            state.device = Some(ports_device(busy));
+            state.update_port_rates();
+        }
+
+        assert_eq!(
+            state.port_rates.get(&1),
+            None,
+            "no new counter has arrived, so no rate has been measured"
+        );
+
+        // When the counters finally move, the rate spans the whole window they
+        // were unchanged over, not the last poll interval.
+        state.device = Some(ports_device(&format!(
+            r#"{{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":{},"rx_bytes":2000}}"#,
+            1000 + WINDOW_DELTA
+        )));
+        state.update_port_rates();
+
+        let (tx_rate, _) = state.port_rates.get(&1).copied().expect("a rate");
+        assert!(
+            (tx_rate - 1000.0).abs() < 10.0,
+            "{WINDOW_DELTA} bytes over the {} seconds since the last new \
+             counter, not over one poll interval, got {tx_rate}",
+            WINDOW.as_secs()
+        );
+    }
+
+    #[test]
+    fn a_device_that_restarts_does_not_report_a_negative_burst() {
+        let mut state = PortsState::new(2);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":9000,"rx_bytes":9000}"#,
+        ));
+        state.update_port_rates();
+        age_baselines(&mut state, WINDOW);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":18000,"rx_bytes":18000}"#,
+        ));
+        state.update_port_rates();
+        assert!(state.port_rates.contains_key(&1), "a rate was measured");
+
+        // The switch reboots and its counters start over.
+        age_baselines(&mut state, WINDOW);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":40,"rx_bytes":30}"#,
+        ));
+        state.update_port_rates();
+
+        assert_eq!(
+            state.port_rates.get(&1),
+            None,
+            "no rate spans a counter reset, and the stale one must not stand"
+        );
+    }
+
+    /// Drive a port up to a measured rate, then hold its counters still for
+    /// `frozen_for`, in polls the controller would plausibly have made.
+    fn measured_then_frozen(frozen_for: Duration) -> PortsState {
+        let mut state = PortsState::new(2);
+        let idle = format!(
+            r#"{{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":{},"rx_bytes":2000}}"#,
+            1000 + WINDOW_DELTA
+        );
+
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":1000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+        age_baselines(&mut state, WINDOW);
+        state.device = Some(ports_device(&idle));
+        state.update_port_rates();
+        assert!(state.port_rates.contains_key(&1), "a rate was measured");
+
+        for _ in 0..10 {
+            age_baselines(&mut state, frozen_for / 10);
+            state.device = Some(ports_device(&idle));
+            state.update_port_rates();
+        }
+        state
+    }
+
+    #[test]
+    fn a_rate_survives_the_gap_between_two_controller_samples() {
+        // The controller resamples about once a minute, so a rate has to
+        // outlive a gap of that order or the view would spend most of its time
+        // showing nothing on a busy port.
+        let state = measured_then_frozen(RATE_MAX_AGE / 2);
+        let text = render_ports(&state, 120, 20);
+        assert!(
+            text.contains("1000 B/s"),
+            "the last real measurement still stands:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_rate_no_new_sample_has_confirmed_in_minutes_becomes_unknown() {
+        let state = measured_then_frozen(RATE_MAX_AGE * 2);
+
+        assert_eq!(
+            state.port_rates.get(&1),
+            None,
+            "nothing has confirmed this rate in minutes, so it is no longer a \
+             statement about what the port is doing"
+        );
+
+        let text = render_ports(&state, 120, 20);
+        assert!(text.contains("Port 1"), "{text}");
+        assert!(
+            !text.contains("1000 B/s"),
+            "a port that stopped carrying traffic must not keep advertising \
+             the rate it had when it stopped:\n{text}"
+        );
+        assert!(
+            !text.contains("0 B/s"),
+            "an idle port and a controller that went quiet are not \
+             distinguishable from here, so neither earns a number:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_port_that_goes_down_stops_reporting_the_rate_it_had_while_up() {
+        let mut state = PortsState::new(2);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":1000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+        age_baselines(&mut state, WINDOW);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":500000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+        assert!(state.port_rates.contains_key(&1), "a rate was measured");
+
+        // The link drops. Its counters are frozen at their final value, so
+        // nothing moves them again and the last measured rate would otherwise
+        // stand on the row forever.
+        age_baselines(&mut state, WINDOW);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":false,"tx_bytes":500000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+
+        let text = render_ports(&state, 120, 20);
+        assert!(text.contains("down"), "the port reports down:\n{text}");
+        assert!(
+            !text.contains("KB/s"),
+            "a severed link carries no traffic, so the throughput measured \
+             while it was up is not what it is doing now:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_port_that_comes_back_up_is_measured_from_when_it_returned() {
+        let mut state = PortsState::new(2);
+
+        // Down for a long time, with the counters frozen where the link left
+        // them.
+        for _ in 0..5 {
+            state.device = Some(ports_device(
+                r#"{"port_idx":1,"name":"Port 1","up":false,"tx_bytes":1000,"rx_bytes":2000}"#,
+            ));
+            state.update_port_rates();
+            age_baselines(&mut state, WINDOW);
+        }
+
+        // The link returns and carries traffic over the next poll.
+        state.device = Some(ports_device(&format!(
+            r#"{{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":{},"rx_bytes":2000}}"#,
+            1000 + WINDOW_DELTA
+        )));
+        state.update_port_rates();
+
+        let (tx_rate, _) = state.port_rates.get(&1).copied().expect("a rate");
+        assert!(
+            (tx_rate - 1000.0).abs() < 10.0,
+            "{WINDOW_DELTA} bytes over the {} seconds since the link returned, \
+             not spread across the whole outage, got {tx_rate}",
+            WINDOW.as_secs()
+        );
+    }
+
+    fn render_ports(state: &PortsState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw_ports(f, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn a_port_with_no_rate_yet_is_not_drawn_as_idle() {
+        let mut state = PortsState::new(2);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":1000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+
+        let text = render_ports(&state, 120, 20);
+        assert!(text.contains("Port 1"), "{text}");
+        assert!(
+            !text.contains("0 B/s"),
+            "one reading is not a throughput measurement:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_measured_rate_is_drawn() {
+        let mut state = PortsState::new(2);
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":1000,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+        age_baselines(&mut state, WINDOW);
+        // Twice WINDOW_DELTA plus the rounding the display does: 2048 B/s is
+        // exactly 2.0 KB/s.
+        state.device = Some(ports_device(
+            r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":205800,"rx_bytes":2000}"#,
+        ));
+        state.update_port_rates();
+
+        let text = render_ports(&state, 120, 20);
+        assert!(
+            text.contains("2.0 KB/s"),
+            "204800 bytes over 100 seconds is 2048 B/s:\n{text}"
+        );
+        assert!(
+            text.contains("0 B/s"),
+            "rx did not move across a sample the controller did publish:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_busy_port_the_controller_has_not_resampled_is_not_drawn_as_idle() {
+        let mut state = PortsState::new(2);
+        let busy = r#"{"port_idx":1,"name":"Port 1","up":true,"tx_bytes":1000,"rx_bytes":2000}"#;
+        state.device = Some(ports_device(busy));
+        state.update_port_rates();
+
+        for _ in 0..5 {
+            age_baselines(&mut state, Duration::from_secs(2));
+            state.device = Some(ports_device(busy));
+            state.update_port_rates();
+        }
+
+        let text = render_ports(&state, 120, 20);
+        assert!(text.contains("Port 1"), "{text}");
+        assert!(
+            !text.contains("0 B/s"),
+            "the controller has published no new sample, which is not the same \
+             as a port carrying no traffic:\n{text}"
+        );
+    }
+
+    // --- A refresh that only half succeeded ---
+    //
+    // The dashboard fetches each section separately, so one endpoint can fail
+    // while the rest of the refresh succeeds. An empty list and a failed
+    // request are different facts, and only the first of them is something the
+    // panel is entitled to report.
+
+    fn health_ok() -> Vec<HealthSubsystem> {
+        vec![serde_json::from_str(r#"{"subsystem":"wan","status":"ok"}"#).unwrap()]
+    }
+
+    fn snapshot(
+        health: Result<Vec<HealthSubsystem>, String>,
+        devices: Result<Vec<LegacyDevice>, String>,
+    ) -> Snapshot {
+        Snapshot {
+            sysinfo: None,
+            host_system: None,
+            health,
+            clients: vec![client_with_mac("1", "Laptop", "aa:bb:cc:00:00:01", 10_000)],
+            devices,
+        }
+    }
+
+    #[test]
+    fn a_controller_with_no_devices_reports_an_empty_network() {
+        let mut state = AppState::new();
+        state.apply_snapshot(snapshot(Ok(health_ok()), Ok(Vec::new())));
+
+        let text = render(&state, 120, 30);
+        assert!(text.contains("Devices (0)"), "{text}");
+        assert!(text.contains("No devices found"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_device_fetch_is_not_reported_as_an_empty_network() {
+        let mut state = AppState::new();
+        state.apply_snapshot(snapshot(
+            Ok(health_ok()),
+            Err("controller returned 500".into()),
+        ));
+
+        let text = render(&state, 120, 30);
+        assert!(
+            !text.contains("No devices found"),
+            "a request that never got an answer cannot report an empty network:\n{text}"
+        );
+        assert!(
+            !text.contains("Devices (0)"),
+            "zero is a count, and this refresh counted nothing:\n{text}"
+        );
+        assert!(text.contains("Devices (unavailable)"), "{text}");
+        assert!(text.contains("controller returned 500"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_device_fetch_keeps_the_devices_it_had_and_marks_them_stale() {
+        let mut state = AppState::new();
+        state.apply_snapshot(snapshot(
+            Ok(health_ok()),
+            Ok(vec![make_device("dd:ee:ff:00:00:01", "AP-Office", "uap")]),
+        ));
+        state.apply_snapshot(snapshot(Ok(health_ok()), Err("timed out".into())));
+
+        let text = render(&state, 120, 30);
+        assert!(
+            text.contains("AP-Office"),
+            "a failed refresh should not blank a panel that had real data:\n{text}"
+        );
+        assert!(
+            text.contains("stale"),
+            "what is on screen is left over from an earlier refresh:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_device_fetch_that_recovers_stops_claiming_to_be_stale() {
+        let mut state = AppState::new();
+        state.apply_snapshot(snapshot(Ok(health_ok()), Err("timed out".into())));
+        state.apply_snapshot(snapshot(
+            Ok(health_ok()),
+            Ok(vec![make_device("dd:ee:ff:00:00:01", "AP-Office", "uap")]),
+        ));
+
+        let text = render(&state, 120, 30);
+        assert!(text.contains("Devices (1)"), "{text}");
+        assert!(!text.contains("stale"), "{text}");
+        assert!(state.resolve_device_name("dd:ee:ff:00:00:01").is_some());
+    }
+
+    #[test]
+    fn a_failed_health_fetch_is_not_an_all_clear() {
+        let mut state = AppState::new();
+        state.apply_snapshot(snapshot(Err("no route to host".into()), Ok(Vec::new())));
+
+        let text = render(&state, 120, 30);
+        assert!(
+            text.contains("health unavailable"),
+            "an absent health strip must not pass for a quiet network:\n{text}"
+        );
+    }
+
+    #[test]
+    fn health_left_over_from_an_earlier_refresh_says_so() {
+        let mut state = AppState::new();
+        state.apply_snapshot(snapshot(Ok(health_ok()), Ok(Vec::new())));
+        state.apply_snapshot(snapshot(Err("no route to host".into()), Ok(Vec::new())));
+
+        let text = render(&state, 120, 30);
+        assert!(text.contains("WAN"), "{text}");
+        assert!(
+            text.contains("health stale"),
+            "green bullets from a minute ago are not the current state:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_refresh_labels_nothing_as_unavailable() {
+        let mut state = AppState::new();
+        state.apply_snapshot(snapshot(Ok(health_ok()), Ok(Vec::new())));
+
+        let text = render(&state, 120, 30);
+        assert!(!text.contains("unavailable"), "{text}");
+        assert!(!text.contains("stale"), "{text}");
+    }
+
+    // --- Handing the terminal back ---
+
+    thread_local! {
+        static RESTORES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_restore() -> io::Result<()> {
+        RESTORES.with(|n| n.set(n.get() + 1));
+        Ok(())
+    }
+
+    /// A guard that records restores instead of driving a real terminal, which
+    /// no test has. Drop is the mechanism under test, so it is exercised
+    /// directly rather than inferred from the type.
+    fn recording_guard() -> TerminalGuard {
+        TerminalGuard {
+            restore: count_restore,
+        }
+    }
+
+    fn restores_during(body: impl FnOnce() + std::panic::UnwindSafe) -> u32 {
+        RESTORES.with(|n| n.set(0));
+        let _ = std::panic::catch_unwind(body);
+        RESTORES.with(|n| n.get())
+    }
+
+    #[test]
+    fn the_terminal_is_handed_back_on_a_clean_exit() {
+        assert_eq!(
+            restores_during(|| {
+                let _guard = recording_guard();
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn the_terminal_is_handed_back_when_the_loop_errors_out() {
+        fn body() -> io::Result<()> {
+            let _guard = recording_guard();
+            Err(io::Error::other("draw failed"))?;
+            unreachable!()
+        }
+        assert_eq!(
+            restores_during(|| {
+                assert!(body().is_err());
+            }),
+            1,
+            "a `?` inside the event loop must still restore the terminal"
+        );
+    }
+
+    #[test]
+    fn the_terminal_is_handed_back_after_a_panic() {
+        assert_eq!(
+            restores_during(|| {
+                let _guard = recording_guard();
+                panic!("something in the draw path");
+            }),
+            1,
+            "unwinding past the guard must still restore the terminal"
+        );
+    }
+
+    #[test]
+    fn detail_overlay_reports_a_device_that_left() {
+        let mut state = dashboard();
+        state.focus = Panel::Devices;
+        state.device_scroll = 1; // Switch-01
+        state.handle_key(press(KeyCode::Enter));
+
+        state
+            .devices
+            .retain(|d| d.name.as_deref() != Some("Switch-01"));
+
+        let text = render(&state, 120, 30);
+        assert!(
+            text.contains("no longer reported"),
+            "the overlay must say the device is gone:\n{text}"
+        );
     }
 }

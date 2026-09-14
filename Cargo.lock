@@ -2786,13 +2786,14 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unifi-cli"
-version = "0.3.0"
+version = "0.4.2"
 dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
  "dirs",
  "jsonschema",
+ "libc",
  "owo-colors",
  "ratatui",
  "reqwest",

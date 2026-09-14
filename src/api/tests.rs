@@ -146,6 +146,17 @@ fn api_error_display_auth() {
 }
 
 #[test]
+fn api_error_display_conflict_has_no_prefix() {
+    // Unlike Auth/NotFound (sentence fragments that get a prefix added),
+    // Conflict messages are written whole, to be read by an operator as-is.
+    let err = ApiError::Conflict("Port 5 on aa:bb:cc:dd:ee:ff does not support PoE.".into());
+    assert_eq!(
+        err.to_string(),
+        "Port 5 on aa:bb:cc:dd:ee:ff does not support PoE."
+    );
+}
+
+#[test]
 fn api_error_display_other() {
     let err = ApiError::Other("something went wrong".into());
     assert_eq!(err.to_string(), "something went wrong");
@@ -161,8 +172,8 @@ fn deserialize_paginated_response() {
         "count": 2,
         "totalCount": 2,
         "data": [
-            {"macAddress": "aa:bb:cc:dd:ee:ff", "ipAddress": "10.0.0.1", "name": "Test", "type": "WIRED"},
-            {"macAddress": "11:22:33:44:55:66", "ipAddress": "10.0.0.2", "hostname": "host2", "type": "WIRELESS"}
+            {"macAddress": "aa:bb:cc:dd:ee:ff", "ipAddress": "192.0.2.1", "name": "Test", "type": "WIRED"},
+            {"macAddress": "11:22:33:44:55:66", "ipAddress": "192.0.2.2", "hostname": "host2", "type": "WIRELESS"}
         ]
     }"#;
     let resp: PaginatedResponse<Client> = serde_json::from_str(json).unwrap();
@@ -199,7 +210,7 @@ fn deserialize_legacy_response_ok() {
     let json = r#"{
         "meta": {"rc": "ok"},
         "data": [
-            {"_id": "abc123", "mac": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.1", "is_wired": true}
+            {"_id": "abc123", "mac": "aa:bb:cc:dd:ee:ff", "ip": "192.0.2.1", "is_wired": true}
         ]
     }"#;
     let resp: LegacyResponse<LegacyClient> = serde_json::from_str(json).unwrap();
@@ -226,15 +237,15 @@ fn deserialize_legacy_response_error() {
 #[test]
 fn deserialize_client_all_fields() {
     let json = r#"{
-        "macAddress": "d0:11:e5:ce:d5:54",
-        "ipAddress": "192.168.1.180",
+        "macAddress": "aa:bb:cc:dd:d5:54",
+        "ipAddress": "198.51.100.180",
         "name": "Mac Mini",
         "hostname": "mac-mini",
         "type": "WIRED"
     }"#;
     let client: Client = serde_json::from_str(json).unwrap();
-    assert_eq!(client.mac_address.as_deref(), Some("d0:11:e5:ce:d5:54"));
-    assert_eq!(client.ip_address.as_deref(), Some("192.168.1.180"));
+    assert_eq!(client.mac_address.as_deref(), Some("aa:bb:cc:dd:d5:54"));
+    assert_eq!(client.ip_address.as_deref(), Some("198.51.100.180"));
     assert_eq!(client.name.as_deref(), Some("Mac Mini"));
     assert_eq!(client.hostname.as_deref(), Some("mac-mini"));
     assert_eq!(client.client_type.as_deref(), Some("WIRED"));
@@ -279,7 +290,7 @@ fn deserialize_legacy_client_full() {
     let json = r#"{
         "_id": "67890",
         "mac": "aa:bb:cc:dd:ee:ff",
-        "ip": "10.0.0.5",
+        "ip": "192.0.2.5",
         "hostname": "myhost",
         "name": "My Client",
         "is_wired": false,
@@ -287,8 +298,8 @@ fn deserialize_legacy_client_full() {
         "tx_bytes": 1048576,
         "rx_bytes": 2097152,
         "signal": -55,
-        "ap_mac": "60:22:32:58:b8:00",
-        "essid": "Notwork"
+        "ap_mac": "aa:bb:cc:dd:b8:00",
+        "essid": "GuestNet"
     }"#;
     let client: LegacyClient = serde_json::from_str(json).unwrap();
     assert_eq!(client.id, "67890");
@@ -298,8 +309,8 @@ fn deserialize_legacy_client_full() {
     assert_eq!(client.tx_bytes, Some(1048576));
     assert_eq!(client.rx_bytes, Some(2097152));
     assert_eq!(client.signal, Some(-55));
-    assert_eq!(client.ap_mac.as_deref(), Some("60:22:32:58:b8:00"));
-    assert_eq!(client.ssid.as_deref(), Some("Notwork"));
+    assert_eq!(client.ap_mac.as_deref(), Some("aa:bb:cc:dd:b8:00"));
+    assert_eq!(client.ssid.as_deref(), Some("GuestNet"));
 }
 
 #[test]
@@ -340,15 +351,15 @@ fn deserialize_site() {
 #[test]
 fn deserialize_device() {
     let json = r#"{
-        "macAddress": "9c:05:d6:bc:06:43",
-        "ipAddress": "192.168.1.1",
+        "macAddress": "aa:bb:cc:dd:06:43",
+        "ipAddress": "198.51.100.1",
         "name": "UCG Ultra",
         "model": "UCG Ultra",
         "state": "ONLINE",
         "firmwareVersion": "5.0.12"
     }"#;
     let device: Device = serde_json::from_str(json).unwrap();
-    assert_eq!(device.mac_address.as_deref(), Some("9c:05:d6:bc:06:43"));
+    assert_eq!(device.mac_address.as_deref(), Some("aa:bb:cc:dd:06:43"));
     assert_eq!(device.name.as_deref(), Some("UCG Ultra"));
     assert_eq!(device.state.as_deref(), Some("ONLINE"));
     assert_eq!(device.firmware_version.as_deref(), Some("5.0.12"));
@@ -395,14 +406,14 @@ fn deserialize_health_wan() {
     let json = r#"{
         "subsystem": "wan",
         "status": "ok",
-        "wan_ip": "81.172.153.156",
-        "isp_name": "Caiway NL"
+        "wan_ip": "203.0.113.156",
+        "isp_name": "ExampleISP NL"
     }"#;
     let health: HealthSubsystem = serde_json::from_str(json).unwrap();
     assert_eq!(health.subsystem, "wan");
     assert_eq!(health.status.as_deref(), Some("ok"));
-    assert_eq!(health.wan_ip.as_deref(), Some("81.172.153.156"));
-    assert_eq!(health.isp_name.as_deref(), Some("Caiway NL"));
+    assert_eq!(health.wan_ip.as_deref(), Some("203.0.113.156"));
+    assert_eq!(health.isp_name.as_deref(), Some("ExampleISP NL"));
 }
 
 #[test]
@@ -461,7 +472,7 @@ fn deserialize_sysinfo_minimal() {
 fn deserialize_event() {
     let json = r#"{
         "key": "EVT_AP_Connected",
-        "msg": "AP[80:2a:a8:cd:47:ab] was connected",
+        "msg": "AP[aa:bb:cc:dd:47:ab] was connected",
         "subsystem": "wlan",
         "time": 1710886800,
         "datetime": "2026-03-19T12:00:00Z"
@@ -543,7 +554,7 @@ fn deserialize_port_entry_minimal() {
 #[test]
 fn deserialize_device_with_ports() {
     let json = r#"{
-        "mac": "9c:05:d6:bc:06:43",
+        "mac": "aa:bb:cc:dd:06:43",
         "name": "USW-24-PoE",
         "model": "USW-24-PoE",
         "port_table": [
@@ -570,8 +581,8 @@ fn deserialize_device_with_empty_port_table() {
 #[test]
 fn deserialize_legacy_device() {
     let json = r#"{
-        "mac": "9c:05:d6:bc:06:43",
-        "ip": "192.168.1.1",
+        "mac": "aa:bb:cc:dd:06:43",
+        "ip": "198.51.100.1",
         "name": "UCG Ultra",
         "model": "UCG Ultra",
         "type": "ugw",
@@ -581,7 +592,7 @@ fn deserialize_legacy_device() {
         "num_sta": 42
     }"#;
     let device: LegacyDevice = serde_json::from_str(json).unwrap();
-    assert_eq!(device.mac.as_deref(), Some("9c:05:d6:bc:06:43"));
+    assert_eq!(device.mac.as_deref(), Some("aa:bb:cc:dd:06:43"));
     assert_eq!(device.name.as_deref(), Some("UCG Ultra"));
     assert_eq!(device.state, Some(1));
     assert_eq!(device.state_str(), "ONLINE");
@@ -639,7 +650,7 @@ fn legacy_device_upgradable_false_explicit() {
 fn host_system_update_available() {
     let json = r#"{"deviceState": "updateAvailable", "name": "UCG Ultra"}"#;
     let host: HostSystem = serde_json::from_str(json).unwrap();
-    assert!(host.update_available());
+    assert_eq!(host.update_available(), Some(true));
     assert_eq!(host.name.as_deref(), Some("UCG Ultra"));
 }
 
@@ -647,14 +658,18 @@ fn host_system_update_available() {
 fn host_system_no_update() {
     let json = r#"{"deviceState": "online"}"#;
     let host: HostSystem = serde_json::from_str(json).unwrap();
-    assert!(!host.update_available());
+    assert_eq!(host.update_available(), Some(false));
 }
 
 #[test]
-fn host_system_missing_state() {
+fn host_system_missing_state_is_unknown_not_up_to_date() {
     let json = r#"{}"#;
     let host: HostSystem = serde_json::from_str(json).unwrap();
-    assert!(!host.update_available());
+    assert_eq!(
+        host.update_available(),
+        None,
+        "a host that reported no device state has not reported an up-to-date one"
+    );
 }
 
 // --- strip_mac_suffix ---
@@ -663,8 +678,8 @@ fn host_system_missing_state() {
 fn strip_mac_suffix_removes_colon_suffix() {
     // MAC aa:bb:cc:dd:ee:ff → suffix " ee:ff"
     assert_eq!(
-        strip_mac_suffix("garage-bluetooth-proxy ee:ff", Some("aa:bb:cc:dd:ee:ff")),
-        "garage-bluetooth-proxy"
+        strip_mac_suffix("lobby-bluetooth-proxy ee:ff", Some("aa:bb:cc:dd:ee:ff")),
+        "lobby-bluetooth-proxy"
     );
 }
 
@@ -672,8 +687,8 @@ fn strip_mac_suffix_removes_colon_suffix() {
 fn strip_mac_suffix_removes_no_colon_suffix() {
     // Also matches " eeff" without colon
     assert_eq!(
-        strip_mac_suffix("garage-bluetooth-proxy eeff", Some("aa:bb:cc:dd:ee:ff")),
-        "garage-bluetooth-proxy"
+        strip_mac_suffix("lobby-bluetooth-proxy eeff", Some("aa:bb:cc:dd:ee:ff")),
+        "lobby-bluetooth-proxy"
     );
 }
 
@@ -762,7 +777,7 @@ fn client_clean_name_falls_back_to_hostname() {
 
 #[test]
 fn client_clean_name_hyphenated_not_stripped() {
-    // "host-ee:ff" has no space before the hex — it's part of the hostname, not a MAC suffix
+    // "host-ee:ff" has no space before the hex, so it's part of the hostname, not a MAC suffix
     let json = r#"{"hostname": "host-ee:ff", "macAddress": "aa:bb:cc:dd:ee:ff"}"#;
     let client: Client = serde_json::from_str(json).unwrap();
     assert_eq!(client.clean_name(), "host-ee:ff");
@@ -811,4 +826,71 @@ fn legacy_client_clean_name_no_mac() {
     let json = r#"{"_id": "x", "name": "device ee:ff"}"#;
     let client: LegacyClient = serde_json::from_str(json).unwrap();
     assert_eq!(client.clean_name(), "device ee:ff");
+}
+
+// --- PortEntry PoE telemetry ---
+
+#[test]
+fn port_entry_parses_poe_telemetry_with_string_numbers() {
+    // The controller returns poe_voltage/poe_current/poe_power as JSON
+    // strings on some firmware, the same quirk PR #3 fixed for poe_power.
+    let json = serde_json::json!({
+        "port_idx": 3,
+        "name": "Port 3",
+        "up": true,
+        "port_poe": true,
+        "poe_enable": true,
+        "poe_mode": "auto",
+        "poe_class": "Class 3",
+        "poe_power": "5.00",
+        "poe_voltage": "53.75",
+        "poe_current": "93.00",
+        "poe_good": true,
+        "autoneg": true,
+        "enable": true,
+        "is_uplink": false,
+        "stp_state": "forwarding",
+        "tx_errors": 0,
+        "rx_errors": 0,
+        "last_connection": {
+            "mac": "aa:bb:cc:dd:ee:20",
+            "connected": true,
+            "last_seen": 1783622695
+        }
+    });
+    let p: PortEntry = serde_json::from_value(json).expect("PortEntry must parse");
+    assert_eq!(p.poe_mode.as_deref(), Some("auto"));
+    assert_eq!(p.poe_class.as_deref(), Some("Class 3"));
+    assert_eq!(p.poe_voltage, Some(53.75));
+    assert_eq!(p.poe_current, Some(93.00));
+    assert_eq!(p.poe_good, Some(true));
+    assert_eq!(p.stp_state.as_deref(), Some("forwarding"));
+    assert_eq!(p.autoneg, Some(true));
+    assert_eq!(p.enable, Some(true));
+    assert_eq!(p.is_uplink, Some(false));
+    let lc = p.last_connection.expect("last_connection present");
+    assert_eq!(lc.mac.as_deref(), Some("aa:bb:cc:dd:ee:20"));
+    assert_eq!(lc.connected, Some(true));
+}
+
+#[test]
+fn port_entry_tolerates_absent_last_connection() {
+    // A port nothing has ever linked to omits last_connection entirely.
+    // This is exactly how the empty test-target port was identified.
+    let json = serde_json::json!({
+        "port_idx": 4,
+        "name": "Port 4",
+        "up": false,
+        "port_poe": true,
+        "poe_enable": false,
+        "poe_mode": "auto"
+    });
+    let p: PortEntry = serde_json::from_value(json).expect("PortEntry must parse");
+    assert!(p.last_connection.is_none());
+    assert_eq!(p.poe_voltage, None);
+    assert!(!p.up);
+    // Absent tri-state keys must read as unknown, never as a confident "no".
+    assert_eq!(p.enable, None, "absent enable must not read as disabled");
+    assert_eq!(p.autoneg, None);
+    assert_eq!(p.is_uplink, None);
 }
