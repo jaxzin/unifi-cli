@@ -116,7 +116,7 @@ to trust the controller and saves `accept_invalid_certs = true` for you.
 ### Destructive commands
 
 `clients block`, `clients unblock`, `clients kick`, `devices restart`,
-`devices upgrade`, `ports cycle` and `protect rtsps delete` all ask before they
+`devices upgrade`, `ports cycle`, `ports poe` and `protect rtsps delete` all ask before they
 act. On a terminal you get a yes/no question naming the target; declining exits
 2 with `kind: confirmation_required` and sends nothing. When stdin is not a
 terminal there is nobody to ask, so they refuse with the same error unless you
@@ -233,6 +233,17 @@ when:
 - the port's PoE is administratively off → `kind: conflict`, exit 6
 - the port isn't currently delivering PoE (`poe_enable: false`) → `kind: conflict`, exit 6
 - the device has no such port index → `kind: not_found`, exit 4
+
+`ports poe <MAC> <PORT> off|auto` sets a port's PoE mode persistently by
+writing the switch's `port_overrides`. It reads the existing overrides and
+changes only `poe_mode` on that port's entry, so every other port's
+configuration is sent back untouched. It asks for confirmation like `cycle`,
+refuses a non-PoE port (`kind: conflict`, exit 6), and does nothing (exit 0)
+when the port is already in the requested mode:
+
+```
+Port 9 on USW Pro Max 24 PoE: PoE mode auto -> off
+```
 
 The off interval (how long the port stays unpowered) is chosen by the
 switch firmware, not by this CLI. The power-cycle command takes only the

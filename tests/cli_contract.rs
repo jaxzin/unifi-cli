@@ -307,6 +307,7 @@ const GATED_INVOCATIONS: &[(&str, &[&str])] = &[
     ("devices restart", &["aa:bb:cc:dd:ee:ff"]),
     ("devices upgrade", &["aa:bb:cc:dd:ee:ff"]),
     ("ports cycle", &["aa:bb:cc:dd:ee:ff", "5"]),
+    ("ports poe", &["aa:bb:cc:dd:ee:ff", "5", "off"]),
     ("protect rtsps delete", &["front-door"]),
 ];
 

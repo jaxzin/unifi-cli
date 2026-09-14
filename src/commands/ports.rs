@@ -786,6 +786,109 @@ where
     Ok(CycleOutcome::Cycled)
 }
 
+/// Outcome of `ports poe`. `Unchanged` means the port was already in the
+/// requested mode, so neither the prompt nor the write happened.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PoeOutcome {
+    Changed,
+    Unchanged,
+    Declined,
+}
+
+/// Return `overrides` with the entry for `port_idx` carrying `poe_mode`.
+///
+/// The controller's `port_overrides` array is the full desired configuration
+/// for every overridden port: sending a list without an entry resets that
+/// port. So every other entry is kept verbatim, and within the matching entry
+/// only `poe_mode` is touched. When no entry exists one is appended. Returns
+/// `None` when the matching entry already has that mode, so the caller can
+/// skip the write.
+pub fn merge_poe_override(
+    overrides: &[serde_json::Value],
+    port_idx: u32,
+    mode: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let mut merged = overrides.to_vec();
+    let existing = merged
+        .iter_mut()
+        .find(|o| o.get("port_idx").and_then(|v| v.as_u64()) == Some(u64::from(port_idx)));
+    match existing {
+        Some(entry) => {
+            if entry.get("poe_mode").and_then(|v| v.as_str()) == Some(mode) {
+                return None;
+            }
+            entry
+                .as_object_mut()?
+                .insert("poe_mode".into(), serde_json::Value::String(mode.into()));
+        }
+        None => merged.push(serde_json::json!({"port_idx": port_idx, "poe_mode": mode})),
+    }
+    Some(merged)
+}
+
+/// Set one port's PoE mode to `mode` (`off` or `auto`).
+///
+/// Reads the device first, so an unknown device, a missing port and a port
+/// that is not PoE-capable are all refused before any write. `confirm`
+/// receives the summary line and is only called when a change is needed.
+pub async fn poe<F>(
+    client: &UnifiClient,
+    mac: &str,
+    port_idx: u32,
+    mode: &str,
+    out: OutputConfig,
+    confirm: F,
+) -> Result<PoeOutcome, Box<dyn std::error::Error>>
+where
+    F: FnOnce(&str) -> std::io::Result<bool>,
+{
+    let device = client.get_device_ports(mac).await?;
+    let port = find_port(&device, port_idx)?;
+    let device_mac = format_mac(device.mac.as_deref().unwrap_or(mac));
+    if !port.port_poe {
+        return Err(ApiError::Conflict(format!(
+            "Port {port_idx} on {device_mac} does not support PoE. \
+             Run `unifi ports list {device_mac}` to see PoE-capable ports."
+        ))
+        .into());
+    }
+    let (_, device_name) = device_identity(&device, &device_mac);
+    let before = port.poe_mode.clone().unwrap_or_else(|| "unknown".into());
+    let line = format!("Port {port_idx} on {device_name}: PoE mode {before} -> {mode}");
+    let result = serde_json::json!({
+        "device": device_mac,
+        "port_idx": port_idx,
+        "poe_mode_before": before,
+        "poe_mode_after": mode,
+    });
+
+    // The port table is the effective state; an override entry may be absent
+    // (the port runs on its profile default) or stale.
+    let merged = if before == mode {
+        None
+    } else {
+        Some(
+            merge_poe_override(&device.port_overrides, port_idx, mode)
+                .unwrap_or_else(|| device.port_overrides.clone()),
+        )
+    };
+    let Some(merged) = merged else {
+        out.print_result(&result, &line);
+        return Ok(PoeOutcome::Unchanged);
+    };
+
+    if !confirm(&line)? {
+        return Ok(PoeOutcome::Declined);
+    }
+    let device_id = device.id.as_deref().ok_or_else(|| ApiError::Api {
+        status: 200,
+        message: format!("Controller did not report an _id for device {device_mac}"),
+    })?;
+    client.set_port_overrides(device_id, &merged).await?;
+    out.print_result(&result, &line);
+    Ok(PoeOutcome::Changed)
+}
+
 /// One-line description of what is about to lose power, shown at the prompt.
 pub fn cycle_summary(device: &DeviceWithPorts, port: &PortEntry) -> String {
     let device_mac = device
@@ -1042,6 +1145,48 @@ mod tests {
             "port_table": ports
         }))
         .expect("fixture must parse")
+    }
+
+    #[test]
+    fn merge_poe_override_preserves_other_ports_and_other_keys() {
+        let overrides = vec![
+            serde_json::json!({"port_idx": 1, "name": "uplink", "op_mode": "switch"}),
+            serde_json::json!({"port_idx": 9, "name": "cam", "poe_mode": "auto",
+                               "portconf_id": "abc", "stp_port_mode": false}),
+            serde_json::json!({"port_idx": 12, "poe_mode": "off"}),
+        ];
+        let merged = merge_poe_override(&overrides, 9, "off").expect("change needed");
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0], overrides[0]);
+        assert_eq!(merged[2], overrides[2]);
+        assert_eq!(
+            merged[1],
+            serde_json::json!({"port_idx": 9, "name": "cam", "poe_mode": "off",
+                               "portconf_id": "abc", "stp_port_mode": false})
+        );
+    }
+
+    #[test]
+    fn merge_poe_override_inserts_when_absent() {
+        let overrides = vec![serde_json::json!({"port_idx": 1, "name": "uplink"})];
+        let merged = merge_poe_override(&overrides, 9, "off").expect("change needed");
+        assert_eq!(
+            merged,
+            vec![
+                serde_json::json!({"port_idx": 1, "name": "uplink"}),
+                serde_json::json!({"port_idx": 9, "poe_mode": "off"}),
+            ]
+        );
+        assert_eq!(
+            merge_poe_override(&[], 3, "auto"),
+            Some(vec![serde_json::json!({"port_idx": 3, "poe_mode": "auto"})])
+        );
+    }
+
+    #[test]
+    fn merge_poe_override_is_noop_when_unchanged() {
+        let overrides = vec![serde_json::json!({"port_idx": 9, "poe_mode": "off"})];
+        assert_eq!(merge_poe_override(&overrides, 9, "off"), None);
     }
 
     #[test]

@@ -503,11 +503,18 @@ where
 // Device with port_table from Legacy stat/device endpoint
 #[derive(Debug, Deserialize)]
 pub struct DeviceWithPorts {
+    /// Controller object id, the target of `PUT /rest/device/<_id>`.
+    #[serde(rename = "_id")]
+    pub id: Option<String>,
     pub mac: Option<String>,
     pub name: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
     pub port_table: Vec<PortEntry>,
+    /// Per-port configuration overrides, kept as raw JSON so a write-back
+    /// preserves every key this CLI does not model.
+    #[serde(default)]
+    pub port_overrides: Vec<serde_json::Value>,
 }
 
 // --- Protect API types ---

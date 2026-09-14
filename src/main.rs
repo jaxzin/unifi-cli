@@ -8,7 +8,7 @@ use unifi_cli::output::{
 
 mod schema;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 #[derive(Parser)]
@@ -288,6 +288,30 @@ enum PortsCommand {
         /// Port index (see `unifi ports list <MAC>`)
         port: u32,
     },
+    /// Set a single port's PoE mode (off or auto)
+    Poe {
+        /// MAC address of the switch (not the attached device)
+        mac: String,
+        /// Port index (see `unifi ports list <MAC>`)
+        port: u32,
+        /// PoE mode to set
+        mode: PoeMode,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PoeMode {
+    Off,
+    Auto,
+}
+
+impl PoeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            PoeMode::Off => "off",
+            PoeMode::Auto => "auto",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1596,6 +1620,40 @@ async fn run() {
                 match outcome {
                     Ok(commands::ports::CycleOutcome::Cycled) => Ok(()),
                     Ok(commands::ports::CycleOutcome::Declined) => {
+                        print_error_envelope(
+                            "confirmation_required",
+                            "Aborted: confirmation declined.",
+                            None,
+                        );
+                        std::process::exit(exit_codes::CONFIRMATION_REQUIRED);
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            PortsCommand::Poe { mac, port, mode } => {
+                refuse_without_tty(cli.yes, "poe");
+                let skip_prompt = cli.yes;
+                let outcome =
+                    commands::ports::poe(&client, &mac, port, mode.as_str(), out, |summary| {
+                        if skip_prompt {
+                            return Ok(true);
+                        }
+                        let mut stdin = std::io::stdin().lock();
+                        let mut stderr = std::io::stderr();
+                        confirm_destructive(
+                            &mut stdin,
+                            &mut stderr,
+                            summary,
+                            "Change this port's PoE mode?",
+                        )
+                    })
+                    .await;
+                match outcome {
+                    Ok(
+                        commands::ports::PoeOutcome::Changed
+                        | commands::ports::PoeOutcome::Unchanged,
+                    ) => Ok(()),
+                    Ok(commands::ports::PoeOutcome::Declined) => {
                         print_error_envelope(
                             "confirmation_required",
                             "Aborted: confirmation declined.",

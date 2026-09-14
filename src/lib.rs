@@ -21,5 +21,6 @@ pub const CONFIRMATION_GATED_COMMANDS: &[&str] = &[
     "devices restart",
     "devices upgrade",
     "ports cycle",
+    "ports poe",
     "protect rtsps delete",
 ];

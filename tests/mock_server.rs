@@ -3318,6 +3318,274 @@ mod command_output {
         );
     }
 
+    // --- Ports poe (port_overrides merge) ---
+    //
+    // The PUT replaces the device's whole `port_overrides` array, so the body
+    // matcher asserts the exact merged list: other ports' overrides and other
+    // keys in the target entry must survive, or the switch reconfigures them.
+
+    fn poe_device_body(overrides: serde_json::Value, poe_mode: &str) -> serde_json::Value {
+        serde_json::json!({
+            "meta": {"rc": "ok"},
+            "data": [{
+                "_id": "dev123", "mac": "aa:bb:cc:dd:ee:09", "name": "USW Pro Max 24 PoE",
+                "port_table": [
+                    {"port_idx": 9, "port_poe": true, "poe_mode": poe_mode},
+                    {"port_idx": 25, "port_poe": false, "media": "SFP+"}
+                ],
+                "port_overrides": overrides
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn ports_poe_put_merges_and_preserves_other_overrides() {
+        let server = MockServer::start().await;
+        let overrides = serde_json::json!([
+            {"port_idx": 1, "name": "uplink", "native_networkconf_id": "net1"},
+            {"port_idx": 9, "name": "camera", "portconf_id": "pc1", "poe_mode": "auto"},
+            {"port_idx": 17, "poe_mode": "off", "autoneg": false, "speed": 100}
+        ]);
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(poe_device_body(overrides, "auto")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .and(body_json(serde_json::json!({"port_overrides": [
+                {"port_idx": 1, "name": "uplink", "native_networkconf_id": "net1"},
+                {"port_idx": 9, "name": "camera", "portconf_id": "pc1", "poe_mode": "off"},
+                {"port_idx": 17, "poe_mode": "off", "autoneg": false, "speed": 100}
+            ]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"}, "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let mut summary = String::new();
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "AA:BB:CC:DD:EE:09",
+            9,
+            "off",
+            out_json(),
+            |s| {
+                summary = s.to_string();
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Changed);
+        assert_eq!(
+            summary,
+            "Port 9 on USW Pro Max 24 PoE: PoE mode auto -> off"
+        );
+    }
+
+    #[tokio::test]
+    async fn ports_poe_inserts_override_when_port_has_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(poe_device_body(
+                serde_json::json!([{"port_idx": 1, "name": "uplink"}]),
+                "auto",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .and(body_json(serde_json::json!({"port_overrides": [
+                {"port_idx": 1, "name": "uplink"},
+                {"port_idx": 9, "poe_mode": "off"}
+            ]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"}, "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Changed);
+    }
+
+    #[tokio::test]
+    async fn ports_poe_already_in_mode_never_prompts_or_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(poe_device_body(
+                serde_json::json!([{"port_idx": 9, "poe_mode": "off"}]),
+                "off",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            |_| panic!("must not prompt when nothing changes"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Unchanged);
+    }
+
+    #[tokio::test]
+    async fn ports_poe_declined_never_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let outcome = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            |_| Ok(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Declined);
+    }
+
+    #[tokio::test]
+    async fn ports_poe_non_poe_port_is_conflict_and_never_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            25,
+            "off",
+            out_table(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<unifi_cli::api::ApiError>(),
+            Some(unifi_cli::api::ApiError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ports_poe_unknown_device_is_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "11:22:33:44:55:66",
+            9,
+            "off",
+            out_table(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<unifi_cli::api::ApiError>(),
+            Some(unifi_cli::api::ApiError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn ports_poe_controller_error_rc_is_reported() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "error", "msg": "api.err.Invalid"}, "data": []
+            })))
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("api.err.Invalid"), "{err}");
+    }
+
     #[tokio::test]
     async fn ports_cycle_missing_port_is_not_found_and_never_posts() {
         let server = MockServer::start().await;

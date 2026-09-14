@@ -246,6 +246,20 @@ fn command_metadata() -> HashMap<&'static str, CommandMeta> {
         ),
     );
 
+    m.insert(
+        "ports poe",
+        f(
+            &[
+                ("device", "string"),
+                ("port_idx", "integer"),
+                ("poe_mode_before", "string"),
+                ("poe_mode_after", "string"),
+            ],
+            true,
+            None,
+        ),
+    );
+
     // networks / events / system
     m.insert("networks list", f(fields::NETWORKS_LIST, false, None));
     m.insert(

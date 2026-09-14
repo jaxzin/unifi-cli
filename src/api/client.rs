@@ -418,6 +418,36 @@ impl UnifiClient {
         Ok(())
     }
 
+    /// Replace a device's `port_overrides` array. The controller treats the
+    /// array as the whole desired set, so callers must pass the merged list
+    /// (see `commands::ports::merge_poe_override`), never a single entry.
+    pub async fn set_port_overrides(
+        &self,
+        device_id: &str,
+        port_overrides: &[serde_json::Value],
+    ) -> Result<(), ApiError> {
+        let path = format!("/rest/device/{device_id}");
+        let resp = self
+            .put_legacy(
+                &path,
+                &serde_json::json!({ "port_overrides": port_overrides }),
+            )
+            .await?;
+        if let Some(rc) = resp.pointer("/meta/rc").and_then(|v| v.as_str())
+            && rc != "ok"
+        {
+            return Err(ApiError::Api {
+                status: 200,
+                message: resp
+                    .pointer("/meta/msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn upgrade_device(&self, mac: &str) -> Result<(), ApiError> {
         let formatted = format_mac(&normalize_mac(mac));
         self.post_legacy_cmd(
