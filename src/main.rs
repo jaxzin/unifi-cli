@@ -1633,8 +1633,14 @@ async fn run() {
             PortsCommand::Poe { mac, port, mode } => {
                 refuse_without_tty(cli.yes, "poe");
                 let skip_prompt = cli.yes;
-                let outcome =
-                    commands::ports::poe(&client, &mac, port, mode.as_str(), out, |summary| {
+                let outcome = commands::ports::poe(
+                    &client,
+                    &mac,
+                    port,
+                    mode.as_str(),
+                    out,
+                    commands::ports::VerifyPolicy::default(),
+                    |summary| {
                         if skip_prompt {
                             return Ok(true);
                         }
@@ -1646,8 +1652,9 @@ async fn run() {
                             summary,
                             "Change this port's PoE mode?",
                         )
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 match outcome {
                     Ok(
                         commands::ports::PoeOutcome::Changed

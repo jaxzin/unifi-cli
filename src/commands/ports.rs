@@ -831,12 +831,15 @@ pub fn merge_poe_override(
 /// Reads the device first, so an unknown device, a missing port and a port
 /// that is not PoE-capable are all refused before any write. `confirm`
 /// receives the summary line and is only called when a change is needed.
+/// After the write the device is re-read per `verify` until the port reports
+/// the new mode; success is printed only then.
 pub async fn poe<F>(
     client: &UnifiClient,
     mac: &str,
     port_idx: u32,
     mode: &str,
     out: OutputConfig,
+    verify: VerifyPolicy,
     confirm: F,
 ) -> Result<PoeOutcome, Box<dyn std::error::Error>>
 where
@@ -862,19 +865,19 @@ where
         "poe_mode_after": mode,
     });
 
-    // The port table is the effective state; an override entry may be absent
-    // (the port runs on its profile default) or stale.
-    let merged = if before == mode {
-        None
-    } else {
-        Some(
-            merge_poe_override(&device.port_overrides, port_idx, mode)
-                .unwrap_or_else(|| device.port_overrides.clone()),
-        )
-    };
-    let Some(merged) = merged else {
+    if before == mode {
         out.print_result(&result, &line);
         return Ok(PoeOutcome::Unchanged);
+    }
+    // The saved override already asks for this mode but the port does not
+    // report it: re-sending the same list would change nothing, so refuse
+    // rather than claim success.
+    let Some(merged) = merge_poe_override(&device.port_overrides, port_idx, mode) else {
+        return Err(ApiError::Conflict(format!(
+            "Port {port_idx} on {device_mac}: saved override already sets poe_mode={mode} \
+             but the port reports poe_mode={before}; not re-sending an unchanged override"
+        ))
+        .into());
     };
 
     if !confirm(&line)? {
@@ -885,8 +888,44 @@ where
         message: format!("Controller did not report an _id for device {device_mac}"),
     })?;
     client.set_port_overrides(device_id, &merged).await?;
-    out.print_result(&result, &line);
-    Ok(PoeOutcome::Changed)
+
+    // Only report success once the port itself reports the new mode.
+    let mut reported = before.clone();
+    for attempt in 0..verify.attempts {
+        if attempt > 0 {
+            tokio::time::sleep(verify.delay).await;
+        }
+        let readback = client.get_device_ports(&device_mac).await?;
+        reported = find_port(&readback, port_idx)?
+            .poe_mode
+            .clone()
+            .unwrap_or_else(|| "unknown".into());
+        if reported == mode {
+            out.print_result(&result, &line);
+            return Ok(PoeOutcome::Changed);
+        }
+    }
+    Err(ApiError::Conflict(format!(
+        "Controller accepted the change but port {port_idx} on {device_mac} still reports poe_mode={reported}"
+    ))
+    .into())
+}
+
+/// How long `poe` waits for the port table to reflect a written mode.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyPolicy {
+    pub attempts: u32,
+    pub delay: std::time::Duration,
+}
+
+impl Default for VerifyPolicy {
+    /// About ten seconds: provisioning a port change is usually a few seconds.
+    fn default() -> Self {
+        Self {
+            attempts: 10,
+            delay: std::time::Duration::from_secs(1),
+        }
+    }
 }
 
 /// One-line description of what is about to lose power, shown at the prompt.

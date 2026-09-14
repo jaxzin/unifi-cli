@@ -3338,6 +3338,35 @@ mod command_output {
         })
     }
 
+    fn fast_verify() -> unifi_cli::commands::ports::VerifyPolicy {
+        unifi_cli::commands::ports::VerifyPolicy {
+            attempts: 3,
+            delay: std::time::Duration::from_millis(10),
+        }
+    }
+
+    /// First GET answers `first`, every later GET (the post-PUT readback)
+    /// answers `then`.
+    async fn mount_device_sequence(
+        server: &MockServer,
+        first: serde_json::Value,
+        then: serde_json::Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(then))
+            .with_priority(2)
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn ports_poe_put_merges_and_preserves_other_overrides() {
         let server = MockServer::start().await;
@@ -3346,14 +3375,12 @@ mod command_output {
             {"port_idx": 9, "name": "camera", "portconf_id": "pc1", "poe_mode": "auto"},
             {"port_idx": 17, "poe_mode": "off", "autoneg": false, "speed": 100}
         ]);
-        Mock::given(method("GET"))
-            .and(path("/proxy/network/api/s/default/stat/device"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(poe_device_body(overrides, "auto")),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
+        mount_device_sequence(
+            &server,
+            poe_device_body(overrides.clone(), "auto"),
+            poe_device_body(overrides, "off"),
+        )
+        .await;
         Mock::given(method("PUT"))
             .and(path("/proxy/network/api/s/default/rest/device/dev123"))
             .and(body_json(serde_json::json!({"port_overrides": [
@@ -3376,6 +3403,7 @@ mod command_output {
             9,
             "off",
             out_json(),
+            fast_verify(),
             |s| {
                 summary = s.to_string();
                 Ok(true)
@@ -3393,14 +3421,15 @@ mod command_output {
     #[tokio::test]
     async fn ports_poe_inserts_override_when_port_has_none() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/proxy/network/api/s/default/stat/device"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(poe_device_body(
+        mount_device_sequence(
+            &server,
+            poe_device_body(
                 serde_json::json!([{"port_idx": 1, "name": "uplink"}]),
                 "auto",
-            )))
-            .mount(&server)
-            .await;
+            ),
+            poe_device_body(serde_json::json!([]), "off"),
+        )
+        .await;
         Mock::given(method("PUT"))
             .and(path("/proxy/network/api/s/default/rest/device/dev123"))
             .and(body_json(serde_json::json!({"port_overrides": [
@@ -3421,11 +3450,87 @@ mod command_output {
             9,
             "off",
             out_table(),
+            fast_verify(),
             |_| Ok(true),
         )
         .await
         .unwrap();
         assert_eq!(outcome, unifi_cli::commands::ports::PoeOutcome::Changed);
+    }
+
+    #[tokio::test]
+    async fn ports_poe_override_disagrees_with_port_table_is_error_and_never_puts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(poe_device_body(
+                serde_json::json!([{"port_idx": 9, "poe_mode": "off", "name": "cam"}]),
+                "auto",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("poe_mode=off") && msg.contains("poe_mode=auto"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ports_poe_readback_mismatch_is_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/proxy/network/api/s/default/stat/device"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(poe_device_body(serde_json::json!([]), "auto")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/proxy/network/api/s/default/rest/device/dev123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": {"rc": "ok"}, "data": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = mock_client(&server).await;
+        let err = unifi_cli::commands::ports::poe(
+            &client,
+            "aa:bb:cc:dd:ee:09",
+            9,
+            "off",
+            out_table(),
+            fast_verify(),
+            |_| Ok(true),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("accepted the change but port 9") && msg.contains("poe_mode=auto"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
@@ -3452,6 +3557,7 @@ mod command_output {
             9,
             "off",
             out_table(),
+            fast_verify(),
             |_| panic!("must not prompt when nothing changes"),
         )
         .await
@@ -3483,6 +3589,7 @@ mod command_output {
             9,
             "off",
             out_table(),
+            fast_verify(),
             |_| Ok(false),
         )
         .await
@@ -3514,6 +3621,7 @@ mod command_output {
             25,
             "off",
             out_table(),
+            fast_verify(),
             |_| Ok(true),
         )
         .await
@@ -3543,6 +3651,7 @@ mod command_output {
             9,
             "off",
             out_table(),
+            fast_verify(),
             |_| Ok(true),
         )
         .await
@@ -3579,6 +3688,7 @@ mod command_output {
             9,
             "off",
             out_table(),
+            fast_verify(),
             |_| Ok(true),
         )
         .await
